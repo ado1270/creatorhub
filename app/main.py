@@ -121,6 +121,8 @@ from .settings import get_setting, set_setting
 from .engine_settings import (EngineSettingsPatch, export_engine_settings,
                               load_persisted_engine_settings, save_engine_settings)
 from .lead_push import lead_push_settings, push_comment_leads, validate_lead_push_url
+from .license import (effective_status, license_enforced, license_settings,
+                      license_loop, verify as verify_license)
 from .quota import monthly_lead_usage
 from .quality import rank_works
 from .transport_matrix import (
@@ -465,7 +467,7 @@ def _seed_browser_runtimes() -> list[dict]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global browser, engine, im_receiver, _webhook_delivery_task
+    global browser, engine, im_receiver, _webhook_delivery_task, _license_task
     init_db(cfg.db_path)
     try:
         with get_session() as session:
@@ -560,11 +562,23 @@ async def lifespan(app: FastAPI):
                 print(f"[webhook] 事件投递循环异常: {exc!r}")
             await asyncio.sleep(15)
     _webhook_delivery_task = asyncio.create_task(webhook_delivery_loop())
+    # 套餐以 gdb15 下发的为准。先同步一次再启动循环，避免用旧额度跑起来。
+    try:
+        lic = await verify_license(cfg)
+        if lic.get("checked"):
+            print(f"[startup] 已从 gdb15 获取套餐：{lic.get('status')}")
+        elif lic.get("reason"):
+            print(f"[startup] 授权校验未完成：{lic['reason']}")
+    except Exception as e:
+        print(f"[startup] 授权校验失败(不影响启动): {e!r}")
+    _license_task = asyncio.create_task(license_loop(cfg))
     yield
     if _webhook_delivery_task:
         _webhook_delivery_task.cancel()
         await asyncio.gather(_webhook_delivery_task, return_exceptions=True)
         _webhook_delivery_task = None
+    _license_task.cancel()
+    await asyncio.gather(_license_task, return_exceptions=True)
     follow_tasks = [task for task in _follow_sync_tasks.values()
                     if not task.done()]
     for task in follow_tasks:
@@ -5357,6 +5371,10 @@ class SettingsIn(BaseModel):
     lead_push_enabled: bool | None = None
     lead_push_url: str | None = None
     lead_push_api_key: str | None = None      # 留空=不修改已保存的 Key
+    # 服务端权威套餐(License)：开启后本地 config.yaml 的 plan 段不再算数
+    license_enabled: bool | None = None
+    license_url: str | None = None
+    license_api_key: str | None = None         # 留空=不修改已保存的 Key
 
 
 def _settings_dict() -> dict:
@@ -5374,6 +5392,10 @@ def _settings_dict() -> dict:
         "lead_push_url": get_setting(
             "lead_push_url", "https://www.gdb15.com/api/v1/leads/webhook"),
         "lead_push_api_key_set": bool(get_setting("lead_push_api_key", "")),
+        "license_enabled": get_setting("license_enabled", "0") == "1",
+        "license_enforced": license_enforced(),
+        "license_url": get_setting("license_url", ""),
+        "license_api_key_set": bool(get_setting("license_api_key", "")),
     }
 
 
@@ -5467,6 +5489,19 @@ async def put_settings(body: SettingsIn):
         set_setting("lead_push_url", url)
     if body.lead_push_api_key:
         set_setting("lead_push_api_key", body.lead_push_api_key.strip())
+    if body.license_enabled is not None:
+        want = bool(body.license_enabled)
+        if not want and license_enforced():
+            # 本机已经有服务端授权缓存，关掉开关就等于退回本地无限配额。
+            raise HTTPException(400, "已完成服务端授权，不能关闭授权校验")
+        set_setting("license_enabled", "1" if want else "0")
+    if body.license_url is not None:
+        url = str(body.license_url or "").strip().rstrip("/")
+        if url and not url.startswith("https://"):
+            raise HTTPException(400, "gdb15 授权地址必须是 HTTPS")
+        set_setting("license_url", url)
+    if body.license_api_key:
+        set_setting("license_api_key", body.license_api_key.strip())
     return _settings_dict()
 
 
@@ -7698,6 +7733,7 @@ async def plan_usage():
         else max(0, cfg.plan.monthly_lead_records - lead_usage))
     return {
         "plan_name": cfg.plan.name or "unlimited",
+        "plan_source": effective_status(cfg).get("source", "local"),
         "active_monitor_slots": limit,
         "monitor_usage": usage,
         "monitor_remaining": remaining,
@@ -7709,6 +7745,26 @@ async def plan_usage():
         "lead_usage": lead_usage,
         "lead_remaining": lead_remaining,
     }
+
+
+@app.get("/api/license/status")
+async def license_status():
+    """当前套餐来源与授权状态。"""
+    return effective_status(cfg)
+
+
+@app.post("/api/license/verify")
+async def license_verify():
+    """手动向 gdb15 校验一次套餐（保存 Key 后测连通性用）。"""
+    result = await verify_license(cfg)
+    return {**result, "status_detail": effective_status(cfg)}
+
+
+@app.post("/api/license/refresh")
+async def license_refresh():
+    """刷新授权并返回最新用量。"""
+    await verify_license(cfg)
+    return effective_status(cfg)
 
 
 @app.post("/api/monitors")

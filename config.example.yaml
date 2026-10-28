@@ -138,6 +138,11 @@ risk_control:
   network_group_cooldown_seconds: 7200
 
 # 商业套餐限制（可选）。不配置具体上限时，本地部署保持不限。
+# 套餐限制。
+#
+# 这里写的是「本地兜底」值。正式交付客户时，强烈建议在设置页打开
+# 「服务端授权」：CreatorHub 会定期向 gdb15 汇报心跳，拿到的套餐覆盖这里
+# 的配置。客户能直接编辑本机 config.yaml，只写在这里等于没有限制。
 plan:
   name: ""
   active_monitor_slots: null   # 例如 5；null=不限

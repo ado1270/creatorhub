@@ -2538,6 +2538,7 @@
     <div class="stack">
       <div class="form-grid cols-auto">
         <div class="form-field"><label>套餐</label><input id="plan-name" value="不限" readonly></div>
+        <div class="form-field"><label>套餐来源</label><input id="plan-source" value="本地配置" readonly></div>
         <div class="form-field"><label>启用监控位</label><input id="plan-monitor-usage" value="不限" readonly></div>
         <div class="form-field"><label>剩余监控位</label><input id="plan-monitor-remaining" value="不限" readonly></div>
         <div class="form-field"><label>账号数</label><input id="plan-account-usage" value="不限" readonly></div>
@@ -2545,6 +2546,52 @@
         <div class="form-field"><label>本月评论线索</label><input id="plan-lead-usage" value="不限" readonly></div>
       </div>
       <p class="field-help">监控位按已启用状态计算：作品监控 + 评论监控 + 弹幕监控。账号数、最低检查频率和月度线索额度由部署配置强制限制。</p>
+    </div>
+  </div>
+
+  <div class="card" data-section="license">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-shield"/></svg></span>
+      <h2>服务端授权 <span class="sub">套餐以 gdb15 下发为准</span></h2>
+    </div>
+    <div class="stack">
+      <label class="check">
+        <input type="checkbox" id="license-enabled">
+        <span>启用服务端套餐校验</span>
+      </label>
+      <div class="form-grid cols-auto">
+        <div class="form-field">
+          <label for="license-url">gdb15 授权地址</label>
+          <input id="license-url" type="url" inputmode="url" autocomplete="url"
+            placeholder="留空则跟随上方推送地址自动推导">
+          <p class="field-help">仅支持 HTTPS。留空时使用线索推送所在的站点。</p>
+        </div>
+        <div class="form-field">
+          <label for="license-key">API Key</label>
+          <div class="input-affix">
+            <input id="license-key" type="password" autocomplete="new-password"
+              placeholder="留空则不修改已保存的 Key">
+            <button class="input-action" type="button" onclick="toggleSecretInput('license-key',this)"
+              aria-label="显示授权 API Key" aria-pressed="false" title="显示或隐藏 API Key">
+              <svg><use href="#i-eye"/></svg>
+            </button>
+          </div>
+          <p class="field-help">留空时复用线索推送的 Key。Key 只保存在本机，不会回显。</p>
+        </div>
+      </div>
+      <p class="field-help">开启并成功授权后，开关会被锁定：客户能直接改本机的
+        config.yaml，关掉开关就等于取消套餐限制，所以授权一旦生效就关不掉了。</p>
+      <div class="form-grid cols-auto">
+        <div class="form-field"><label>授权状态</label><input id="license-state" value="未启用" readonly></div>
+        <div class="form-field"><label>套餐来源</label><input id="license-source" value="本地配置" readonly></div>
+        <div class="form-field"><label>套餐到期</label><input id="license-expires" value="-" readonly></div>
+      </div>
+      <p class="field-help" id="license-message">未启用服务端套餐校验，当前使用本地 config.yaml 配置</p>
+      <div class="form-actions">
+        <span class="status-text" id="license-msg" role="status" aria-live="polite"></span>
+        <button class="ghost" onclick="refreshLicense()"><svg><use href="#i-refresh"/></svg>立即校验</button>
+        <button onclick="saveLicenseSettings()"><svg><use href="#i-check"/></svg>保存授权设置</button>
+      </div>
     </div>
   </div>
   <div class="card appearance-card" data-section="appearance">

@@ -4408,7 +4408,11 @@ async function loadSettings() {
   refreshTransportMatrix();
   try {
     const plan = await api("/api/plan/usage");
-    if ($("plan-name")) $("plan-name").value = plan.plan_name || "不限";
+    if ($("plan-name")) {
+      $("plan-name").value = plan.plan_name || "不限";
+      const src = plan.plan_source === "server" ? "gdb15 下发" : "本地配置";
+      $("plan-source").value = src;
+    }
     if ($("plan-monitor-usage")) {
       $("plan-monitor-usage").value = plan.active_monitor_slots == null
         ? `${plan.monitor_usage.total} / 不限`
@@ -4436,6 +4440,7 @@ async function loadSettings() {
         : `${plan.lead_usage} / ${plan.monthly_lead_records}`;
     }
   } catch (e) {}
+  loadLicenseStatus();
   try {
     const s = await api("/api/settings");
     const assign = (id, property, value) => {
@@ -4455,6 +4460,14 @@ async function loadSettings() {
       assign("lead-push-enabled", "checked", !!s.lead_push_enabled);
       assign("lead-push-url", "value", s.lead_push_url || "");
       $("lead-push-key").placeholder = s.lead_push_api_key_set
+        ? "已保存(留空=不修改)" : "API Key";
+    }
+    if ($("license-enabled")) {
+      assign("license-enabled", "checked", !!s.license_enabled || !!s.license_enforced);
+      // 已经授权过的机器不允许再关掉开关，否则套餐限制就形同虚设。
+      $("license-enabled").disabled = !!s.license_enforced;
+      assign("license-url", "value", s.license_url || "");
+      $("license-key").placeholder = s.license_api_key_set
         ? "已保存(留空=不修改)" : "API Key";
     }
     csSyncAll();
@@ -4502,6 +4515,75 @@ async function testLeadPushSettings() {
     } catch (e) {
       $("lead-push-msg").textContent = "测试失败: " + e.message;
       toast("测试失败:" + e.message, "err");
+    }
+  });
+}
+async function loadLicenseStatus() {
+  try {
+    const st = await api("/api/license/status");
+    const labels = {
+      active: "已授权",
+      expired: "套餐已到期",
+      no_package: "未开通套餐",
+      inactive: "账号已停用",
+      instance_limit: "超出允许台数",
+    };
+    if ($("license-state")) {
+      $("license-state").value = st.enforced
+        ? (labels[st.status] || st.status || "未知") + "（已锁定）"
+        : st.enabled ? (labels[st.status] || st.status || "未知") : "未启用";
+    }
+    if ($("license-source")) {
+      $("license-source").value = st.source === "server" ? "gdb15 下发" : "本地配置";
+    }
+    if ($("license-expires")) {
+      $("license-expires").value = st.package_expires_at
+        ? new Date(st.package_expires_at).toLocaleString() : "-";
+    }
+    if ($("license-message")) $("license-message").textContent = st.message || "";
+  } catch (e) {}
+}
+async function saveLicenseSettings() {
+  $("license-msg").textContent = "保存中…";
+  await withBusy(evtBtn(), "保存中", async () => {
+    try {
+      const body = {
+        license_url: $("license-url").value.trim(),
+      };
+      // 被锁定的机器不要提交开关状态，否则后端会直接报错。
+      if (!$("license-enabled").disabled) {
+        body.license_enabled = $("license-enabled").checked;
+      }
+      const key = $("license-key").value.trim();
+      if (key) body.license_api_key = key;
+      const s = await api("/api/settings", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      $("license-key").value = "";
+      $("license-key").placeholder = s.license_api_key_set
+        ? "已保存(留空=不修改)" : "API Key";
+      $("license-msg").textContent = "已保存 ✓";
+      toast("授权设置已保存", "ok");
+      await loadLicenseStatus();
+    } catch (e) {
+      $("license-msg").textContent = "失败: " + e.message;
+      toast("保存失败:" + e.message, "err");
+    }
+  });
+}
+async function refreshLicense() {
+  $("license-msg").textContent = "校验中…";
+  await withBusy(evtBtn(), "校验中", async () => {
+    try {
+      const st = await api("/api/license/refresh", { method: "POST" });
+      await loadLicenseStatus();
+      $("license-msg").textContent = st.stale ? "缓存已过期" : "校验完成";
+      toast(st.stale ? "授权缓存已过期，请联系服务商" : "授权校验完成 ✓",
+        st.stale ? "err" : "ok");
+    } catch (e) {
+      $("license-msg").textContent = "校验失败: " + e.message;
+      toast("校验失败:" + e.message, "err");
     }
   });
 }
