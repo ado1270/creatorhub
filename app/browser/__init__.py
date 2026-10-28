@@ -20,6 +20,7 @@ from .channels_fetcher import (fetch_channels_works, fetch_channels_comments,
 from .account_hub import (fetch_account_works, fetch_douyin_account_works_api, fetch_follows,
                           fetch_dm_conversations, fetch_dm_history,
                           do_follow, send_dm, send_dm_api)
+from .douyin_secure_api import douyin_secure_post_api, douyin_secure_search_api
 
 __all__ = ["BrowserManager", "cookie_string_to_state",
            "Identity", "generate_identity_fields", "seed_from_id", "fingerprint_script",
@@ -39,4 +40,5 @@ __all__ = ["BrowserManager", "cookie_string_to_state",
            "fetch_channels_self_profile", "post_channels_comment",
            "fetch_account_works", "fetch_douyin_account_works_api", "fetch_follows",
            "fetch_dm_conversations", "fetch_dm_history",
-           "do_follow", "send_dm", "send_dm_api"]
+           "do_follow", "send_dm", "send_dm_api", "douyin_secure_post_api",
+           "douyin_secure_search_api"]

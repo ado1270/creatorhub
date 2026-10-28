@@ -60,6 +60,27 @@ def test_hybrid_resolves_browser_only_capability_without_false_api_claim():
     assert followers["fallback"] == "browser_on_confirmed_failure"
 
 
+def test_keyword_collection_is_api_first_but_risk_does_not_open_browser():
+    cfg = Config()
+    cfg.engine.douyin_read_mode = "hybrid"
+
+    route = resolve_transport(cfg, "douyin", "keyword_collection")
+
+    assert route["effective_mode"] == "hybrid"
+    assert route["hybrid_order"] == "api_first"
+    assert "verification_required/风控时进入冷却且不打开浏览器" in route["note"]
+
+
+def test_default_douyin_writes_are_api_first_hybrid():
+    cfg = Config()
+    assert cfg.engine.douyin_write_mode == "hybrid"
+    for operation in ("comment_write", "follow_write", "dm_send"):
+        route = resolve_transport(cfg, "douyin", operation)
+        assert route["effective_mode"] == "hybrid"
+        assert route["hybrid_order"] == "api_first"
+        assert route["fallback"] == "browser_on_confirmed_failure"
+
+
 def test_matrix_detects_profile_cookie_and_network_collisions_without_secrets():
     cfg = Config()
     accounts = [

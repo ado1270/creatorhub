@@ -28,7 +28,8 @@ from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        fetch_channels_works, fetch_channels_comments,
                        fetch_channels_self_profile, post_channels_comment,
                        fetch_account_works, fetch_douyin_account_works_api,
-                       do_follow, send_dm, send_dm_api)
+                       do_follow, send_dm, send_dm_api,
+                       douyin_secure_post_api)
 from . import compose
 from ..config import Config
 from ..account_lifecycle import AccountUnavailableError
@@ -78,6 +79,10 @@ MAX_AUTO_RETRY = 3
 _WRITE_SUBMIT_PREFIX = "write_submitted:"
 
 log = logging.getLogger("creatorhub.engine")
+
+
+class _AccountCheckBusy(RuntimeError):
+    """An account became busy while a health check waited for its network slot."""
 
 # 账号时区 -> 期望出口国家(ISO2)。仅列常见,匹配不到则跳过地区校验。
 _TZ_COUNTRY = {
@@ -282,7 +287,8 @@ class MonitorEngine:
         self._commenting: set[int] = set()         # 正在执行的评论任务 id
         self._actioning: set[int] = set()           # 正在执行的写操作任务 id
         self._collection_tasks: dict[int, asyncio.Task] = {}  # 一次性关键词采集
-        self._last_acct_check = time.time()   # 上次账号体检时间
+        self._last_acct_check = 0.0   # 启动后首轮校验，不沿用历史“正常”状态
+        self._pending_account_checks: set[int] = set()
         self._geo_checked: dict = {}          # account_id -> 已校验过地区的代理(避免重复探测)
         self.risk = RiskController(cfg)
         self._last_risk_prune_day = None
@@ -426,13 +432,16 @@ class MonitorEngine:
 
     @asynccontextmanager
     async def _operation_guard(self, account_id, kind: OperationKind,
-                               fallback_key: str = "", operation_target=None):
+                               fallback_key: str = "", operation_target=None,
+                               skip_busy: bool = False):
         """Serialize by global limit, network exit, then account profile."""
         account = operation_target or self._load_account(account_id)
         key = f"acc:{account_id}" if account_id else (fallback_key or "anon")
         lock = self.browser.lock_for(key)
         async with self._active_sem:
             async with self.risk.network_guard(account):
+                if skip_busy and lock.locked():
+                    raise _AccountCheckBusy()
                 async with lock:
                     if account_id and self._load_account(account_id) is None:
                         raise AccountUnavailableError("绑定账号已删除，操作已停止")
@@ -1108,13 +1117,37 @@ class MonitorEngine:
                 status = job.status
                 job_error = job.error or ""
                 log_job = job
-            category, _ = classify_platform_error(job_error)
+            category, signal = classify_platform_error(job_error)
             if job_error and category in {
                     RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
                 # 即使已经采到部分结果，验证码/登录态/网络异常也属于本次读取失败；
                 # 不能再记 success，否则会立即放行下一次重读并覆盖风险信号。
-                self.risk.record_failure(
+                failure = self.risk.record_failure(
                     account_id, OperationKind.READ_HEAVY, job_error)
+                if category == RiskCategory.RISK:
+                    with get_session() as s:
+                        deferred_job = s.get(KeywordCollectionJob, job_id)
+                        if deferred_job and deferred_job.status not in {"canceled", "done"}:
+                            deferred_job.status = "pending"
+                            deferred_job.current_step = "API 风控冷却，等待重试"
+                            deferred_job.blocked_reason = job_error
+                            deferred_job.blocked_signal = signal
+                            deferred_job.blocked_operation = OperationKind.READ_HEAVY.value
+                            deferred_job.blocked_at = datetime.utcnow()
+                            deferred_job.next_allowed_at = failure.next_allowed_at
+                            deferred_job.finished_at = None
+                            s.add(deferred_job); s.commit()
+                            self._log_collection_operation(
+                                deferred_job, "deferred", "pending", job_error,
+                                risk_signal=signal,
+                                duration_ms=int((time.monotonic() - started_clock) * 1000))
+                    return {
+                        "ok": True, "deferred": True, "status": "pending",
+                        "reason": job_error, "signal": signal,
+                        "next_allowed_at": (failure.next_allowed_at.isoformat()
+                                            if failure.next_allowed_at else None),
+                        **result,
+                    }
             elif status in {"done", "partial"}:
                 self.risk.record_success(account_id, OperationKind.READ_HEAVY)
                 self._stamp_active(account_id)
@@ -1194,7 +1227,8 @@ class MonitorEngine:
                 s.add(a); s.commit()
 
     def _keepalive_due(self, last_active_at, *, account_id=None) -> bool:
-        """闲置判定:在 idle_keepalive_hours 之后稳定地增加错峰等待。
+        """历史闲置判定（登录态体检不再使用此条件）。
+        在 idle_keepalive_hours 之后稳定地增加错峰等待。
         idle_keepalive_hours<=0 时退回旧行为(每轮都摸)。"""
         hours = self.cfg.engine.idle_keepalive_hours
         if hours <= 0 or last_active_at is None:
@@ -1274,6 +1308,10 @@ class MonitorEngine:
 
     async def _probe_account_health(self, probe) -> dict:
         aid, platform, state, creator_state, proxy, identity = probe
+        # A user-held window owns this lock for its whole lifetime. Never let
+        # one busy account stall the scheduler and every other account's check.
+        if self.browser.lock_for(f"acc:{aid}").locked():
+            return {"ok": False, "deferred": True, "reason": "account_busy"}
         decision = self.risk.preflight(aid, OperationKind.READ_LIGHT)
         if not decision.allowed:
             return {"ok": False, "deferred": True, "reason": decision.reason,
@@ -1288,7 +1326,7 @@ class MonitorEngine:
                 session.commit()
         u, err = {}, ""
         try:
-            async with self._operation_guard(aid, OperationKind.READ_LIGHT):
+            async with self._operation_guard(aid, OperationKind.READ_LIGHT, skip_busy=True):
                 decision = self.risk.preflight(aid, OperationKind.READ_LIGHT)
                 if not decision.allowed:
                     return {"ok": False, "deferred": True,
@@ -1310,12 +1348,14 @@ class MonitorEngine:
                         return {"ok": False, "indeterminate": True,
                                 "error": "仅有创作者登录态，请在账号浏览器中确认；未启动直连探测"}
                     u, err = await fetch_xhs_self_profile(self.browser, identity)
-                elif platform == "douyin" and self.cfg.engine.douyin_read_mode in {"api", "hybrid"}:
-                    with get_session() as session:
-                        account = session.get(DouyinAccount, aid)
-                        sec_uid = account.sec_uid if account else ""
+                elif platform == "douyin":
+                    # Login health follows the account-profile transport, not
+                    # the public content-read mode. Public profiles prove only
+                    # that an account exists, never that its Cookie is valid.
+                    mode = resolve_transport(
+                        self.cfg, "douyin", "account_profile")["effective_mode"]
                     cookie = dy_cookie_from_state(state or creator_state)
-                    if cookie and sec_uid:
+                    if mode in {"api", "hybrid"} and cookie:
                         client = DouyinClient(
                             cookie, identity.ua or self.cfg.engine.user_agent,
                             timeout=self.cfg.engine.request_timeout_seconds,
@@ -1323,17 +1363,17 @@ class MonitorEngine:
                             **douyin_client_environment(identity))
                         try:
                             async with client.session_scope():
-                                profile = await client.fetch_profile(sec_uid)
+                                profile = await client.fetch_self_profile()
                             if profile:
                                 u, err = profile, ""
-                            elif self.cfg.engine.douyin_read_mode == "api":
+                            else:
                                 u, err = {}, client.last_error or "empty_response"
                         except Exception as exc:
-                            if self.cfg.engine.douyin_read_mode == "api":
-                                u, err = {}, f"api:{type(exc).__name__}"
-                    elif self.cfg.engine.douyin_read_mode == "api":
-                        u, err = {}, "no_cookie_or_sec_uid"
-                    if not u and self.cfg.engine.douyin_read_mode == "hybrid":
+                            u, err = {}, exc
+                    elif mode in {"api", "hybrid"}:
+                        u, err = {}, "no_cookie"
+                    auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+                    if mode == "browser" or (not u and mode == "hybrid" and not auth_failed):
                         u, err = await fetch_self_profile(self.browser, identity)
                 elif platform == "xhs" and creator_state:
                     chk = await creator_check(creator_state, proxy=proxy)
@@ -1366,6 +1406,8 @@ class MonitorEngine:
                     self.risk.record_success(aid, OperationKind.READ_LIGHT)
                 elif err:
                     self.risk.record_failure(aid, OperationKind.READ_LIGHT, err)
+        except _AccountCheckBusy:
+            return {"ok": False, "deferred": True, "reason": "account_busy"}
         except Exception as exc:
             self.risk.record_failure(aid, OperationKind.READ_LIGHT, exc)
             return {"ok": False, "error": str(exc)}
@@ -1401,7 +1443,7 @@ class MonitorEngine:
                     account.follower_count = parsed.get("follower_count") or account.follower_count
                     account.aweme_count = parsed.get("aweme_count") or account.aweme_count
                 got_profile = True
-            elif err == "logged_out":
+            elif classify_platform_error(err)[0] == RiskCategory.AUTH:
                 account.status = "invalid"
                 log.warning("账号 %s(%s)登录态失效", aid, account.nickname)
             session.add(account)
@@ -1452,17 +1494,32 @@ class MonitorEngine:
 
     async def _check_accounts(self):
         interval = self.cfg.engine.account_check_interval_seconds
-        if interval <= 0 or time.time() - self._last_acct_check < interval:
+        if interval <= 0:
             return
-        self._last_acct_check = time.time()
+        now = time.time()
+        sweep_due = now - self._last_acct_check >= interval
+        if not sweep_due and not self._pending_account_checks:
+            return
         with get_session() as session:
+            # last_active_at includes public reads. It is not an auth check
+            # timestamp; idle_keepalive_hours must not postpone login checks.
             probes = [self._account_probe_tuple(account)
                       for account in session.exec(select(DouyinAccount)).all()
                       if (account.storage_state or account.creator_storage_state)
-                      and account.status != "invalid"
-                      and self._keepalive_due(account.last_active_at, account_id=account.id)]
+                      and account.status != "invalid"]
+        eligible = {probe[0] for probe in probes}
+        self._pending_account_checks.intersection_update(eligible)
+        if sweep_due:
+            self._last_acct_check = now
+            self._pending_account_checks.update(eligible)
         for probe in probes:
-            await self._probe_account_health(probe)
+            if probe[0] not in self._pending_account_checks:
+                continue
+            result = await self._probe_account_health(probe)
+            # Busy/risk-deferred checks stay due for the next scheduler tick;
+            # don't postpone them for another entire 30-minute interval.
+            if not result.get("deferred"):
+                self._pending_account_checks.discard(probe[0])
 
     # ── 本账号作品健康监控(B5)+ 数据快照(B4)──
     async def _check_work_health(self):
@@ -4721,13 +4778,39 @@ class MonitorEngine:
                             ok, err = await _send_new_or_existing_dm(client)
                         else:
                             ok, err = False, f"未知动作 {action}"
+                if (not ok and dy_write_mode == "hybrid"
+                        and action in {"follow", "unfollow"}
+                        and str(err or "").startswith(
+                            "api_requires_browser_security:")):
+                    secure_data, secure_error, secure_uncertain = (
+                        await douyin_secure_post_api(
+                            self.browser, identity,
+                            "/aweme/v1/web/commit/follow/user/",
+                            {"device_platform": "webapp", "aid": "6383",
+                             "channel": "channel_pc_web"},
+                            {"user_id": target_uid,
+                             "type": 2 if action == "unfollow" else 1},
+                            timeout_ms=(
+                                self.cfg.engine.request_timeout_seconds * 1000)))
+                    method = "api_browser_context"
+                    if secure_uncertain:
+                        ok, err = False, secure_error
+                    elif secure_data is None:
+                        ok, err = False, secure_error
+                    else:
+                        client.last_response = {
+                            "browser_security_context_required": True,
+                            "dtrait_header_attached": True,
+                        }
+                        ok, err = client._write_result(
+                            secure_data, secure_error or "secure_api_no_response")
                 # A known rejection has a response and can fall back; an
                 # ambiguous request is deliberately not submitted twice.
                 if (not ok and dy_write_mode == "hybrid"
                         and not str(err or "").startswith((
                             "write_uncertain:", "target_resolution_failed:"))):
                     category, _signal = classify_platform_error(err)
-                    if category == RiskCategory.BUSINESS:
+                    if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
                         ok, err, method = await _browser_action()
                         method = ("browser_fallback"
                                   if method == "browser" else method)
@@ -4951,18 +5034,53 @@ class MonitorEngine:
                     async with client.session_scope():
                         ok, result, err = await client.post_comment(
                             aweme_id, content, reply_comment_id=target_cid)
+                if (not ok and dy_write_mode == "hybrid"
+                        and str(err or "").startswith(
+                            "api_requires_browser_security:")):
+                    secure_data, secure_error, secure_uncertain = (
+                        await douyin_secure_post_api(
+                            self.browser, identity,
+                            "/aweme/v1/web/comment/publish/",
+                            {"device_platform": "webapp", "aid": "6383",
+                             "channel": "channel_pc_web",
+                             "aweme_id": aweme_id, "item_type": 0},
+                            {"aweme_id": aweme_id, "text": content,
+                             "item_type": 0, "reply_id": target_cid,
+                             "reply_comment_id": target_cid,
+                             "at_users": "[]"},
+                            timeout_ms=(
+                                self.cfg.engine.request_timeout_seconds * 1000)))
+                    method = "api_browser_context"
+                    if secure_uncertain:
+                        ok, result, err = False, "", secure_error
+                    elif secure_data is None:
+                        ok, result, err = False, "", secure_error
+                    else:
+                        client.last_response = {
+                            "browser_security_context_required": True,
+                            "dtrait_header_attached": True,
+                        }
+                        ok, err = client._write_result(
+                            secure_data, secure_error or "secure_api_no_response")
+                        comment = secure_data.get("comment") or {}
+                        result = (str(comment.get("cid")
+                                      or comment.get("comment_id")
+                                      or secure_data.get("comment_id") or "ok")
+                                  if ok else "")
                 # Only a response that clearly rejected the POST may enter the
                 # browser fallback. Unknown request outcome remains uncertain.
                 if (not ok and dy_write_mode == "hybrid"
                         and not str(err or "").startswith("write_uncertain:")):
-                    ok, err = await post_comment_browser(
-                        self.browser, identity, aweme_id, content,
-                        reply_to_text=target_text if target_cid else "",
-                        require_reply=bool(target_cid),
-                        headed=(True if native_mode
-                                else self.cfg.engine.comment_browser_headed))
-                    method = "browser_fallback"
-                    result = "ok" if ok else ""
+                    category, _signal = classify_platform_error(err)
+                    if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
+                        ok, err = await post_comment_browser(
+                            self.browser, identity, aweme_id, content,
+                            reply_to_text=target_text if target_cid else "",
+                            require_reply=bool(target_cid),
+                            headed=(True if native_mode
+                                    else self.cfg.engine.comment_browser_headed))
+                        method = "browser_fallback"
+                        result = "ok" if ok else ""
             else:
                 method = "browser"
                 ok, err = await post_comment_browser(

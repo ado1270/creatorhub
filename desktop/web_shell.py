@@ -97,7 +97,7 @@ def run_desktop(home, *, autostart=False, install_browser=True):
     server = ShellServer(controller)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     window = webview.create_window("CreatorHub", server.origin, width=1100, height=800,
-                                  min_size=(740, 580), background_color="#f6f5f3", text_select=True)
+                                  min_size=(740, 580), background_color="#f4f5f8", text_select=True)
     tray = None
     allow_close = threading.Event()
     def finish():

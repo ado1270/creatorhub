@@ -1,6 +1,7 @@
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
 from app.platforms.douyin.client import DouyinClient
 from app.platforms.douyin.signing import ABogus
@@ -199,6 +200,61 @@ class DouyinClientSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("browser_version=152.0.0.0", url)
         self.assertEqual(headers["Accept-Language"], "zh-TW,zh;q=0.8")
 
+    async def test_stale_screen_cookies_do_not_override_account_viewport(self):
+        state = json.dumps({
+            "cookies": [
+                {"name": "dy_swidth", "value": "800",
+                 "domain": ".douyin.com", "path": "/"},
+                {"name": "dy_sheight", "value": "600",
+                 "domain": ".douyin.com", "path": "/"},
+            ],
+            "origins": [],
+        })
+        client = DouyinClient(
+            "", "Mozilla/5.0 Chrome/152.0.0.0", storage_state=state,
+            screen_width=1366, screen_height=768)
+
+        self.assertEqual((client.screen_width, client.screen_height), (1366, 768))
+
+    async def test_storage_state_identity_is_added_to_api_queries(self):
+        state = json.dumps({
+            "cookies": [{
+                "name": "s_v_web_id", "value": "verify-fixture",
+                "domain": ".douyin.com", "path": "/",
+            }],
+            "origins": [{
+                "origin": "https://www.douyin.com",
+                "localStorage": [{
+                    "name": "__tea_cache_tokens_6383",
+                    "value": json.dumps({
+                        "web_id": "111", "user_unique_id": "222",
+                    }),
+                }],
+            }],
+        })
+        client = DouyinClient(
+            "", "Mozilla/5.0 Chrome/152.0.0.0", storage_state=state)
+
+        query = parse_qs(urlsplit(client._build_url("/fixture", {})).query)
+
+        self.assertEqual(query["webid"], ["222"])
+        self.assertEqual(query["verifyFp"], ["verify-fixture"])
+        self.assertEqual(query["fp"], ["verify-fixture"])
+
+    async def test_secure_writer_uses_current_first_party_origin_and_params(self):
+        client = DouyinClient(
+            "sid_tt=x", "Mozilla/5.0 Chrome/152.0.0.0")
+
+        url = client._build_url(
+            "/aweme/v1/web/commit/follow/user/", {}, body="type=1&user_id=0")
+        query = parse_qs(urlsplit(url).query)
+
+        self.assertEqual(urlsplit(url).netloc, "www-hj.douyin.com")
+        self.assertEqual(query["pc_libra_divert"], ["Windows"])
+        self.assertEqual(query["update_version_code"], ["170400"])
+        self.assertEqual(query["support_h265"], ["0"])
+        self.assertEqual(query["support_dash"], ["0"])
+
     async def test_search_page_extracts_items_and_pagination(self):
         client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
         payload = {
@@ -214,21 +270,122 @@ class DouyinClientSearchTests(unittest.IsolatedAsyncioTestCase):
             "has_more": 1,
             "offset": 20,
         }
-        client._get_json = AsyncMock(return_value=payload)
+        client._get_payloads = AsyncMock(return_value=[payload])
         page = await client.search_awemes_page("测试", count=20)
         self.assertEqual([x["aweme_id"] for x in page["items"]], ["a1", "a2"])
         self.assertTrue(page["has_more"])
         self.assertEqual(page["offset"], 20)
+        self.assertEqual(client._get_payloads.await_args.args[0],
+                         "/aweme/v1/web/general/search/single/")
+        params = client._get_payloads.await_args.args[1]
+        self.assertEqual(params["search_channel"], "aweme_general")
+        self.assertEqual(params["search_source"], "tab_search")
+        self.assertEqual(params["list_type"], "multi")
+        self.assertEqual(params["search_id"], "")
+        self.assertNotIn("filter_selected", params)
+
+    async def test_search_page_merges_stream_payloads(self):
+        client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
+        first = {"data": [{"aweme_info": {
+            "aweme_id": "stream-1", "video": {"play_addr": {"url_list": ["u"]}}
+        }}], "has_more": 1, "offset": 20}
+        second = {"data": [{"aweme_info": {
+            "aweme_id": "stream-2", "video": {"play_addr": {"url_list": ["v"]}}
+        }}], "has_more": 0, "offset": 40}
+        client._get_payloads = AsyncMock(return_value=[first, second])
+        page = await client.search_awemes_page("显卡", count=20)
+        self.assertEqual([row["aweme_id"] for row in page["items"]],
+                         ["stream-1", "stream-2"])
+        self.assertTrue(page["has_more"])
+        self.assertEqual(page["offset"], 40)
+
+    async def test_search_page_chains_response_logid(self):
+        client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
+        client._get_payloads = AsyncMock(side_effect=[[{
+            "data": [], "has_more": 1, "offset": 15,
+            "extra": {"logid": "search-log-1"},
+        }], [{"data": [], "has_more": 0, "offset": 30}]])
+
+        await client.search_awemes_page("显卡", offset=0, count=15)
+        await client.search_awemes_page("显卡", offset=15, count=15)
+
+        second_params = client._get_payloads.await_args_list[1].args[1]
+        self.assertEqual(second_params["search_id"], "search-log-1")
+
+    async def test_new_keyword_resets_search_id_chain(self):
+        client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
+        client._search_id = "previous-keyword-log"
+        client.search_awemes_page = AsyncMock(return_value={
+            "items": [], "has_more": False, "offset": 0, "error": "",
+        })
+
+        await client.search_awemes("新关键词", max_pages=1)
+
+        self.assertEqual(client._search_id, "")
+
+    async def test_search_url_omits_a_bogus_and_uses_xmst(self):
+        xmst = "x" * 184
+        state = json.dumps({
+            "cookies": [],
+            "origins": [{
+                "origin": "https://www.douyin.com",
+                "localStorage": [{"name": "xmst", "value": xmst}],
+            }],
+        })
+        client = DouyinClient(
+            "", "Mozilla/5.0 Chrome/130.0.0.0", storage_state=state)
+
+        with patch("app.platforms.douyin.client.gen_real_ms_token",
+                   new=AsyncMock(side_effect=AssertionError("xmst should win"))):
+            await client._prepare_ms_token(
+                "https://www.douyin.com/aweme/v1/web/general/search/single/")
+        url = client._build_url(
+            "/aweme/v1/web/general/search/single/", {"keyword": "显卡"})
+        query = parse_qs(urlsplit(url).query)
+
+        self.assertEqual(query["msToken"], [xmst])
+        self.assertNotIn("a_bogus", query)
+        self.assertEqual(client._token_source, "account_local_storage_xmst")
+
+    def test_replace_storage_state_refreshes_api_cookie_context(self):
+        client = DouyinClient("sid_tt=old", "Mozilla/5.0 Chrome/130.0.0.0")
+        client._ms_token = "stale"
+        client.replace_storage_state({"cookies": [{
+            "name": "sid_tt", "value": "new", "domain": ".douyin.com", "path": "/"
+        }], "origins": []})
+        self.assertIn("sid_tt=new", client.cookie)
+        self.assertIsNone(client._ms_token)
 
     async def test_search_reports_verification_for_api_only_mode(self):
         client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
-        client._get_json = AsyncMock(return_value={
+        client._get_payloads = AsyncMock(return_value=[{
             "data": [],
             "search_nil_info": {"search_nil_type": "verify_check"},
-        })
+        }])
         items, error = await client.search_awemes("测试", max_pages=1)
         self.assertEqual(items, [])
         self.assertEqual(error, "verification_required")
+
+    async def test_search_business_login_rejection_is_not_an_empty_result(self):
+        client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
+        client._get_payloads = AsyncMock(return_value=[{
+            "status_code": 2483,
+            "status_msg": "请先登录再继续使用",
+        }])
+        items, error = await client.search_awemes("测试", max_pages=1)
+        self.assertEqual(items, [])
+        self.assertEqual(error, "logged_out")
+        self.assertEqual(client.last_error, "logged_out")
+
+    async def test_search_unknown_business_rejection_keeps_status_code(self):
+        client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
+        client._get_payloads = AsyncMock(return_value=[{
+            "status_code": 12345,
+            "status_msg": "request rejected",
+        }])
+        items, error = await client.search_awemes("测试", max_pages=1)
+        self.assertEqual(items, [])
+        self.assertEqual(error, "api_rejected:status_code=12345")
 
     async def test_session_scope_reuses_ms_token(self):
         client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
@@ -278,6 +435,8 @@ class DouyinClientSearchTests(unittest.IsolatedAsyncioTestCase):
         class Response:
             status_code = 200
             content = b'{"status_code":0,"comment":{"cid":"c1"}}'
+            headers = {"content-type": "application/json"}
+            cookies = None
 
             def json(self):
                 return {"status_code": 0, "comment": {"cid": "c1"}}
@@ -294,9 +453,111 @@ class DouyinClientSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertEqual(cid, "c1")
         self.assertEqual(error, "")
-        form = fake_session.post.await_args.kwargs["data"]
+        request = fake_session.post.await_args
+        form = dict(parse_qsl(request.kwargs["data"], keep_blank_values=True))
         self.assertEqual(form["reply_id"], "parent-1")
         self.assertEqual(form["reply_comment_id"], "parent-1")
+        self.assertEqual(request.kwargs["headers"]["Content-Type"],
+                         "application/x-www-form-urlencoded;charset=UTF-8")
+
+    async def test_post_signature_binds_exact_form_body_sent_on_wire(self):
+        client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
+        captured = {}
+
+        class Response:
+            status_code = 200
+            content = b'{"status_code":0}'
+            headers = {"content-type": "application/json"}
+            cookies = None
+
+            def json(self):
+                return {"status_code": 0}
+
+        fake_session = AsyncMock()
+        fake_session.post = AsyncMock(return_value=Response())
+        fake_session.close = AsyncMock()
+
+        def signer(query, user_agent, *, body="", fp=""):
+            captured.update(query=query, user_agent=user_agent, body=body, fp=fp)
+            return query + "&a_bogus=SIGNED"
+
+        with patch("app.platforms.douyin.client.AsyncSession", return_value=fake_session), \
+                patch("app.platforms.douyin.client.gen_real_ms_token",
+                      new=AsyncMock(return_value="stable-token")), \
+                patch("app.platforms.douyin.client.sign_url", side_effect=signer):
+            async with client.session_scope():
+                data = await client._post_json(
+                    "/aweme/v1/web/comment/publish/",
+                    {"aweme_id": "aweme-1", "item_type": 0},
+                    {"aweme_id": "aweme-1", "text": "收到 & ok",
+                     "reply_id": "", "item_type": 0})
+
+        expected = urlencode({
+            "aweme_id": "aweme-1", "text": "收到 & ok",
+            "reply_id": "", "item_type": "0",
+        })
+        request = fake_session.post.await_args
+        self.assertEqual(data, {"status_code": 0})
+        self.assertEqual(captured["body"], expected)
+        self.assertEqual(request.kwargs["data"], expected)
+        self.assertEqual(parse_qs(urlsplit(request.args[0]).query)["a_bogus"],
+                         ["SIGNED"])
+        self.assertTrue(client.last_response["a_bogus_body_bound"])
+        self.assertEqual(client.last_response["business_code"], 0)
+
+    async def test_post_attaches_account_bound_security_headers_and_classifies_403(self):
+        state = json.dumps({
+            "cookies": [
+                {"name": "UIFID", "value": "device-fixture",
+                 "domain": ".douyin.com", "path": "/"},
+                {"name": "passport_csrf_token", "value": "csrf-fixture",
+                 "domain": ".douyin.com", "path": "/"},
+                {"name": "bd_ticket_guard_client_data", "value": "ticket-fixture",
+                 "domain": ".douyin.com", "path": "/"},
+            ],
+        })
+        client = DouyinClient(
+            "", "Mozilla/5.0 Chrome/130.0.0.0", storage_state=state)
+
+        class Response:
+            status_code = 403
+            content = b""
+            headers = {
+                "content-type": "application/json",
+                "bd-ticket-guard-result": "1101",
+            }
+            cookies = None
+
+        fake_session = AsyncMock()
+        fake_session.post = AsyncMock(return_value=Response())
+        fake_session.close = AsyncMock()
+        with patch("app.platforms.douyin.client.AsyncSession", return_value=fake_session), \
+                patch("app.platforms.douyin.client.gen_real_ms_token",
+                      new=AsyncMock(return_value="stable-token")):
+            async with client.session_scope():
+                data = await client._post_json(
+                    "/aweme/v1/web/commit/follow/user/", {},
+                    {"user_id": "0", "type": 1})
+
+        request = fake_session.post.await_args
+        headers = request.kwargs["headers"]
+        self.assertIsNone(data)
+        self.assertEqual(headers["uifid"], "device-fixture")
+        self.assertEqual(headers["x-secsdk-csrf-token"], "csrf-fixture")
+        self.assertEqual(
+            headers["bd-ticket-guard-client-data"], "ticket-fixture")
+        self.assertEqual(client.last_error,
+                         "api_requires_browser_security:http_403")
+        self.assertFalse(client.last_write_uncertain)
+        self.assertEqual(client.last_response["http_status"], 403)
+        self.assertEqual(client.last_response["ticket_guard_result"], "1101")
+        self.assertTrue(client.last_response["a_bogus_body_bound"])
+        self.assertTrue(client.last_response["device_header_attached"])
+        self.assertTrue(client.last_response["csrf_header_attached"])
+        self.assertTrue(client.last_response["ticket_guard_client_attached"])
+        self.assertFalse(client.last_response["dtrait_header_attached"])
+        self.assertEqual(client.last_response["rejection_reason"],
+                         "browser_security_context_required")
 
     async def test_post_comment_business_rejection_is_retryable_for_hybrid(self):
         client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
@@ -308,6 +569,23 @@ class DouyinClientSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cid, "")
         self.assertTrue(error.startswith("api_rejected:status_code=8"))
         self.assertFalse(client.last_write_uncertain)
+
+    async def test_protected_write_login_message_requires_dtrait_before_auth_loss(self):
+        client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
+        client.last_response = {
+            "browser_security_context_required": True,
+            "dtrait_header_attached": False,
+        }
+        ok, error = client._write_result(
+            {"status_code": 8, "status_msg": "用户未登录"}, "no_response")
+        self.assertFalse(ok)
+        self.assertTrue(error.startswith("api_requires_browser_security:"))
+
+        client.last_response["dtrait_header_attached"] = True
+        ok, error = client._write_result(
+            {"status_code": 8, "status_msg": "用户未登录"}, "no_response")
+        self.assertFalse(ok)
+        self.assertTrue(error.startswith("logged_out:"))
 
     async def test_post_comment_invalid_success_body_is_uncertain(self):
         client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")
@@ -324,6 +602,10 @@ class DouyinClientSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await client.set_follow_state("uid-1", unfollow=True), (True, ""))
         forms = [call.args[2] for call in client._post_json.await_args_list]
         self.assertEqual([form["type"] for form in forms], [1, 2])
+        self.assertEqual([call.args[1] for call in client._post_json.await_args_list],
+                         [{}, {}])
+        self.assertEqual([set(form) for form in forms],
+                         [{"user_id", "type"}, {"user_id", "type"}])
 
     async def test_post_timeout_is_marked_uncertain(self):
         client = DouyinClient("sid_tt=x", "Mozilla/5.0 Chrome/130.0.0.0")

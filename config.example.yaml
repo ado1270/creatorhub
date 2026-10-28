@@ -13,13 +13,13 @@ engine:
   resident_browser_sessions: true # reuse one account browser process/Profile/task page
   browser_session_idle_seconds: 1800 # idle recycle; 0=LRU/explicit close/shutdown only
   xhs_read_mode: browser          # browser=读取也复用账号浏览器;api=显式签名 API 兼容模式
-  douyin_read_mode: hybrid         # hybrid=API优先/浏览器回退;api=仅API;browser=仅浏览器
+  douyin_read_mode: hybrid         # hybrid=API优先，普通兼容失败才回退浏览器；验证/风控直接冷却
   douyin_profile_mode: hybrid      # 手动刷新资料:hybrid/API/browser
   douyin_followers_mode: hybrid    # 粉丝同步:hybrid/API/browser
   douyin_dm_sync_mode: hybrid      # 私信会话同步:hybrid/API/browser
   douyin_creator_danmaku_mode: hybrid # 本账号作品弹幕:hybrid/API/browser
   douyin_publish_mode: browser     # 发布当前仅 browser
-  douyin_write_mode: browser       # browser=页面写入;api=仅网页HTTP/imapi;hybrid=API优先、明确拒绝时回退页面
+  douyin_write_mode: hybrid        # hybrid=API优先、明确拒绝时回退页面;api=仅API;browser=仅页面
   xhs_keyword_gap_seconds: 10     # 同一任务相邻关键词的最小停顿
   xhs_item_gap_seconds: 2.5       # 相邻详情/评论读取的最小停顿
   xhs_request_jitter: 0.35        # 小红书读取停顿的正向随机抖动比例
@@ -43,12 +43,12 @@ engine:
   danmaku_max_probe_points: 120   # 单条视频最多探测的时间点数
   danmaku_max_records_per_scan: 1000 # 单轮最多入库弹幕数,0=不限
   danmaku_max_records_total: 0    # 每个监控最多保留记录数,0=不限
-  account_check_interval_seconds: 1800   # 账号登录态定时体检间隔(秒,0=关闭)
+  account_check_interval_seconds: 1800   # 登录态独立体检间隔(秒,0=关闭)；启动首轮检查，普通读取不延后
   # 自有账号评论模式(创作中心)页面 URL —— 实验性,抖音改版/字段变了改这里
   creator_comment_url: https://creator.douyin.com/creator-micro/interaction/comment-management
   creator_danmaku_url: https://creator.douyin.com/creator-micro/interaction/danmaku-management
   request_timeout_seconds: 20
-  douyin_captcha_wait_seconds: 300 # 关键词采集遇验证时等待人工处理；期间不产生搜索请求
+  douyin_captcha_wait_seconds: 300 # 浏览器模式等待人工验证；API风控直接冷却
   douyin_keyword_gap_seconds: 8    # 同一任务内相邻抖音关键词的停顿秒数
   download_timeout_seconds: 120
   media_dir: ./data/media         # 下载文件落地目录

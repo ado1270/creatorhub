@@ -43,7 +43,7 @@ async def resolve_sec_uid(text: str, user_agent: str) -> Optional[str]:
     return None
 
 
-async def resolve_aweme_id(text: str, user_agent: str) -> Optional[str]:
+async def resolve_aweme_id(text: str, user_agent: str, *, proxy: str = "") -> Optional[str]:
     """从视频链接/短链/纯数字 id 解析 aweme_id。"""
     text = text.strip()
     if re.fullmatch(r"\d{15,}", text):
@@ -56,7 +56,7 @@ async def resolve_aweme_id(text: str, user_agent: str) -> Optional[str]:
         try:
             async with AsyncSession(impersonate=impersonate_for_ua(user_agent)) as cli:
                 r = await cli.get(short.group(0), headers={"User-Agent": user_agent},
-                                  timeout=15)
+                                  timeout=15, proxy=proxy or None)
                 final = str(r.url)
                 m = _AWEME_RE.search(final) or _MODAL_RE.search(final)
                 if m:

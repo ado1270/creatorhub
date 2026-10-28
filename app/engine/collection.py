@@ -216,8 +216,10 @@ class KeywordCollector:
             job = session.get(KeywordCollectionJob, job_id)
             if not job:
                 return
-            job.error_count += 1
             lines = [line for line in (job.error or "").splitlines() if line]
+            if message[:360] in lines:
+                return
+            job.error_count += 1
             lines.append(message[:360])
             job.error = "\n".join(lines[-8:])[:2400]
             session.add(job)
@@ -257,10 +259,12 @@ class KeywordCollector:
                                job: KeywordCollectionJob,
                                client: DouyinClient | None = None,
                                context=None) -> tuple[list[dict], str]:
-        identity = self.browser.identity_for(account)
         mode = str(getattr(self.cfg.engine, "douyin_read_mode", "hybrid") or "hybrid")
         if mode in {"api", "hybrid"} and client is not None:
+            items, error = [], ""
+            api_compatibility_failure = False
             try:
+                print("[dy-search] HTTP search/single API 请求")
                 items, error = await client.search_awemes(
                     keyword,
                     max_results=job.max_contents_per_keyword,
@@ -271,14 +275,31 @@ class KeywordCollector:
                     min_likes=job.min_likes,
                     min_comments=job.min_comments,
                 )
-                if items or mode == "api":
-                    return items, ("抖音搜索接口失败: " + error if error else "")
-                if error:
-                    print(f"[dy-search] API 空响应({error}),回退浏览器")
             except Exception as exc:
+                message = f"抖音搜索接口异常: {exc!r}"
+                category, _ = classify_platform_error(exc)
+                if mode == "api" or category in {
+                        RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
+                    return [], message
+                print(f"[dy-search] API 兼容性异常，浏览器回退: {type(exc).__name__}")
+                api_compatibility_failure = True
+            if items:
+                return items, ("抖音搜索接口失败: " + error if error else "")
+            if not error and not api_compatibility_failure:
+                return [], ""
+            if error:
+                message = f"抖音搜索接口失败: {error}"
+                category, _ = classify_platform_error(message)
+                if error == "verification_required" or category in {
+                        RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
+                    print("[dy-search] API 返回验证/风控信号，进入冷却，不打开浏览器")
+                    return [], message
                 if mode == "api":
-                    return [], f"抖音搜索接口异常: {exc!r}"
-                print(f"[dy-search] API 异常({type(exc).__name__}),回退浏览器")
+                    return [], message
+                print(f"[dy-search] API 兼容性失败，浏览器回退: {error}")
+        elif mode == "api":
+            return [], "抖音搜索接口异常: API 客户端不可用"
+        identity = self.browser.identity_for(account)
         return await fetch_douyin_search(
             self.browser, identity, keyword,
             max_results=job.max_contents_per_keyword,
@@ -755,6 +776,7 @@ class KeywordCollector:
             douyin_client = DouyinClient(
                 douyin_cookie_from_state(account.storage_state), identity.ua,
                 timeout=self.cfg.engine.request_timeout_seconds, proxy=proxy,
+                storage_state=account.storage_state,
                 **douyin_client_environment(identity))
         elif not self._xhs_browser_reads_enabled():
             cookie = cookie_str_from_state(account.storage_state)
@@ -776,18 +798,19 @@ class KeywordCollector:
                         job_id, job, account, keywords, proxy,
                         douyin_client=douyin_client, context=None)
 
-            # browser/hybrid：抖音可能针对无头搜索返回验证码中间页，因此复用一次
-            # 临时可见 context；hybrid 同时保留 HTTP session 供 API 优先路径使用。
-            self._progress(job_id, step="启动抖音可见采集窗口")
-            async with self.browser.temporary_headed_context(identity) as context:
-                if mode == "browser":
-                    return await self._run_keywords(
-                        job_id, job, account, keywords, proxy,
-                        douyin_client=douyin_client, context=context)
+            # Hybrid 先走 API；只有普通兼容性失败才允许浏览器回退。
+            # verification_required/风控/登录/网络信号由调度器冷却，不开浏览器。
+            if mode == "hybrid":
+                self._progress(job_id, step="启动抖音 API 优先采集")
                 async with douyin_client.session_scope():
                     return await self._run_keywords(
                         job_id, job, account, keywords, proxy,
-                        douyin_client=douyin_client, context=context)
+                        douyin_client=douyin_client, context=None)
+            self._progress(job_id, step="启动抖音可见采集窗口")
+            async with self.browser.temporary_headed_context(identity) as context:
+                return await self._run_keywords(
+                    job_id, job, account, keywords, proxy,
+                    douyin_client=douyin_client, context=context)
         if xhs_client is not None:
             async with xhs_client.session_scope():
                 return await self._run_keywords(

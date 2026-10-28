@@ -17,6 +17,13 @@ _CHARSET = string.ascii_letters + string.digits + "=_-"
 _REAL_URL = "https://mssdk.bytedance.com/web/report"
 
 
+class _SessionToken(str):
+    def __new__(cls, value, source):
+        result = super().__new__(cls, value)
+        result.source = source
+        return result
+
+
 def gen_false_ms_token(length: int = 126) -> str:
     """对应 genFalseMsToken:本地伪造,长度 126。"""
     return "".join(random.choice(_CHARSET) for _ in range(length))
@@ -35,7 +42,7 @@ async def gen_real_ms_token(user_agent: str, timeout: float = 10.0,
     try:
         # 用 session 读 cookie jar(curl_cffi 的响应级 cookies 不可靠,set-cookie 进 session jar)
         async with AsyncSession(impersonate=impersonate_for_ua(user_agent)) as cli:
-            await cli.post(
+            response = await cli.post(
                 _REAL_URL,
                 params={"msToken": gen_false_ms_token()},
                 json=payload,
@@ -46,8 +53,8 @@ async def gen_real_ms_token(user_agent: str, timeout: float = 10.0,
                 proxy=proxy or None,
             )
             for c in cli.cookies.jar:
-                if c.name == "msToken":
-                    return c.value
+                if response.status_code == 200 and c.name == "msToken" and c.value:
+                    return _SessionToken(c.value, "sdk")
     except Exception:
         pass
-    return gen_false_ms_token()
+    return _SessionToken(gen_false_ms_token(), "random_fallback")

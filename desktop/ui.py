@@ -6,11 +6,11 @@ import tkinter as tk
 from tkinter import ttk
 
 COLORS = {
-    "bg": "#f5f5f7", "surface": "#ffffff", "fg": "#333338",
-    "strong": "#1d1d1f", "muted": "#616169", "line": "#d6d6dc",
-    "soft": "#efeff2", "accent": "#c71f46", "hover": "#c3163e",
-    "success": "#07733f", "success_bg": "#edf7f1",
-    "warning": "#925600", "warning_bg": "#fff5e7",
+    "bg": "#f4f5f8", "surface": "#ffffff", "fg": "#2c313c",
+    "strong": "#14161c", "muted": "#525866", "line": "#dcdfe6",
+    "soft": "#eef0f5", "accent": "#d9244e", "hover": "#bf1b41",
+    "success": "#0d8a4e", "success_bg": "#eaf6f0",
+    "warning": "#b45309", "warning_bg": "#fef5e7",
 }
 
 

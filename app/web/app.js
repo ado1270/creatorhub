@@ -1455,7 +1455,7 @@ function switchTab(name, pushHistory = false) {
   window.scrollTo({ top: 0, behavior: "auto" });
   if (changed) requestAnimationFrame(() => {
     const title = $("page-title");
-    if (title) title.focus({ preventScroll: true });
+    if (title && (!activePanel || !activePanel.contains(document.activeElement))) title.focus({ preventScroll: true });
   });
   if (name === "hub") { refreshHubSummary(); refreshHubPanel(); }
   else stopDmStream();   // 离开本账号管理即断开私信实时流

@@ -14,6 +14,9 @@ class _Locator:
     async def is_visible(self, **_kwargs):
         return self.visible
 
+    async def all(self):
+        return [self]
+
 
 class _Page:
     def __init__(self, *, login_visible=False):

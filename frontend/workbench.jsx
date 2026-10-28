@@ -187,7 +187,21 @@ function SectionTabs({ group, platform }) {
     }
   }, [value]);
   return <Tabs.Root ref={root} value={value} onValueChange={setValue} className="wb-tabs">
-    <Tabs.List ref={list} className="wb-tablist" aria-label={visible.map(item => item.label).join("、")}>
+    <Tabs.List ref={list} className="wb-tablist" aria-label={visible.map(item => item.label).join("、")} onKeyDown={e => {
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const tabs = [...list.current.querySelectorAll('[role="tab"]:not(:disabled)')];
+      const idx = tabs.indexOf(e.target);
+      if (idx < 0 || !tabs.length) return;
+      const next = e.key === "ArrowRight" ? (idx + 1) % tabs.length
+        : e.key === "ArrowLeft" ? (idx - 1 + tabs.length) % tabs.length
+        : e.key === "Home" ? 0
+        : e.key === "End" ? tabs.length - 1 : -1;
+      if (next >= 0 && visible[next]) {
+        e.preventDefault();
+        flushSync(() => setValue(visible[next].value));
+        tabs[next].focus();
+      }
+    }}>
       {visible.map(item => <Tabs.Trigger key={item.value} value={item.value} className="wb-tab">{item.label}</Tabs.Trigger>)}
     </Tabs.List>
     {group.items.map(item => <Tabs.Content key={item.value} value={item.value} forceMount hidden={item.value !== value} className="wb-tabpanel">

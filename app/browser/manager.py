@@ -14,8 +14,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
+import uuid
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from patchright.async_api import BrowserContext, async_playwright
@@ -206,11 +209,13 @@ class BrowserManager:
                  fingerprint_chromium_allow_headless: bool = False,
                  fingerprint_chromium_platform: str = "auto",
                  fingerprint_chromium_runtimes: list[dict] | None = None,
-                 fingerprint_default_runtime_id: str = ""):
+                 fingerprint_default_runtime_id: str = "",
+                 douyin_read_session_callback=None):
         self.default_ua = default_ua
         self.profiles_root = profiles_root
         self.max_live = max(1, max_live)
         self._native_ua_callback = native_ua_callback
+        self._douyin_read_session_callback = douyin_read_session_callback
         # ``playwright`` 是 1.61 以前配置文件使用的后端名；读取时平滑
         # 迁移到 Patchright，避免升级后意外切回 auto/CDP。
         requested_mode = "patchright" if xhs_browser_mode == "playwright" else xhs_browser_mode
@@ -277,6 +282,8 @@ class BrowserManager:
         self._fingerprint_backend = self._default_fingerprint_backend()
         self._pw = None
         self._contexts: Dict[Any, BrowserContext] = {}   # key -> 持久化 context
+        self._startup_pages: Dict[Any, tuple] = {}
+        self._douyin_api_observers: Dict[Any, tuple] = {}
         self._cdp_sessions: Dict[Any, Any] = {}
         self._backend_by_key: Dict[Any, str] = {}
         self._runtime_by_key: Dict[Any, str] = {}
@@ -1096,6 +1103,18 @@ class BrowserManager:
         #    正好会经过这条路径。只补缺失项，不覆盖 profile 中更新过的 Cookie。
         await self._bridge_identity_cookies(
             ctx, identity, assume_empty=was_empty)
+        if (identity.platform == "douyin" and identity.account_id is not None
+                and self._douyin_read_session_callback is not None):
+            from .douyin_api_session import observe_douyin_api_session
+            observer = observe_douyin_api_session(ctx, identity, self._douyin_read_session_callback)
+            self._douyin_api_observers[identity.key] = (ctx, observer)
+
+            def forget_observer(*_):
+                entry = self._douyin_api_observers.get(identity.key)
+                if entry and entry[0] is ctx:
+                    self._douyin_api_observers.pop(identity.key, None)
+
+            ctx.on("close", forget_observer)
         return ctx
 
     @staticmethod
@@ -1148,6 +1167,7 @@ class BrowserManager:
 
     async def _close_key_unlocked(self, key: Any) -> None:
         ctx = self._contexts.pop(key, None)
+        self._startup_pages.pop(key, None)
         session = self._cdp_sessions.pop(key, None)
         self._task_pages.pop(key, None)
         self._last_used.pop(key, None)
@@ -1156,6 +1176,8 @@ class BrowserManager:
         self._fallback_reason_by_key.pop(key, None)
         self._proxy_signature_by_key.pop(key, None)
         try:
+            if ctx is not None:
+                await self._flush_douyin_api_observer(key, ctx)
             if session is not None and self._cdp_backend is not None:
                 with suppress(Exception):
                     await self._cdp_backend.close(session)
@@ -1164,6 +1186,9 @@ class BrowserManager:
                 with suppress(Exception):
                     await ctx.close()
         finally:
+            observer = self._douyin_api_observers.get(key)
+            if observer and observer[0] is ctx:
+                self._douyin_api_observers.pop(key, None)
             self._release_profile_lock(key)
 
     async def rebind_context(self, old_key: Any, new_key: Any) -> bool:
@@ -1184,6 +1209,8 @@ class BrowserManager:
                 await self._close_key_unlocked(new_key)
             maps = (
                 self._contexts,
+                self._startup_pages,
+                self._douyin_api_observers,
                 self._cdp_sessions,
                 self._task_pages,
                 self._last_used,
@@ -1266,6 +1293,9 @@ class BrowserManager:
                     if effective_backend == FINGERPRINT_CHROMIUM_BACKEND:
                         self._runtime_by_key[key] = runtime_id
                 self._contexts[key] = ctx
+                self._startup_pages[key] = tuple(
+                    page for page in (getattr(ctx, "pages", ()) or ())
+                    if getattr(page, "url", "") == "about:blank")
                 # Native/Fingerprint Chromium may fill ``identity.ua`` while
                 # launching the first context. Store the post-launch signature;
                 # keeping the pre-launch (empty-UA) value makes the very next
@@ -1386,6 +1416,44 @@ class BrowserManager:
                     await route.continue_()
             await page.route("**/*", _route)
         return page
+
+    async def _flush_douyin_api_observer(self, key, context) -> None:
+        entry = self._douyin_api_observers.get(key)
+        if entry and entry[0] is context:
+            with suppress(Exception):
+                await entry[1].drain_pending()
+
+    async def release_task_page(self, identity: Identity, page) -> bool:
+        """Close a one-shot task and its otherwise-empty managed browser.
+
+        Call under the account read guard. Only the original startup blank
+        tabs are disposable; another task/user tab (even a new blank tab), a
+        manual window, or a replaced context must never be closed here.
+        """
+        key = identity.key
+        context = getattr(page, "context", None) if page is not None else self._contexts.get(key)
+        if context is not None:
+            await self._flush_douyin_api_observer(key, context)
+        if page is not None:
+            with suppress(Exception):
+                await page.close()
+        async with self._cv_lock:
+            if context is None or self._contexts.get(key) is not context:
+                return False
+            startup = self._startup_pages.get(key, ())
+            try:
+                for remaining in context.pages:
+                    if remaining is page or remaining.is_closed():
+                        continue
+                    if not any(remaining is initial for initial in startup):
+                        return False
+                    if remaining.url != "about:blank":
+                        return False
+            except Exception:
+                # An incomplete inventory is not evidence of an empty window.
+                return False
+            await self._close_key_unlocked(key)
+            return True
 
     async def _visible_task_page(self, identity: Identity):
         """Reuse the account's owned task tab before creating a CDP page.
@@ -1725,6 +1793,36 @@ class BrowserManager:
             else:
                 with suppress(Exception):
                     await ctx.close()
+
+    @asynccontextmanager
+    async def temporary_fresh_headed_context(self, identity: Identity):
+        """Open one isolated visible context while preserving account cookies.
+
+        Douyin can bind a verification state to the persistent browser profile even
+        after the signed read API starts returning verification_required. A unique
+        profile gives the idempotent browser retry a clean security context while
+        keeping the account cookie bridge and stable device identity unchanged.
+        """
+        profile = (Path(self.profiles_root) / "_douyin_read"
+                   / f"acc_{identity.account_id or 'anon'}_{uuid.uuid4().hex}")
+        fresh_identity = replace(
+            identity,
+            account_id=None,
+            profile_dir=str(profile),
+        )
+        ctx = None
+        try:
+            ctx = await self._launch_persistent(fresh_identity, headless=False)
+            await self._bridge_identity_cookies(
+                ctx, identity, assume_empty=True, overwrite=True)
+            yield ctx
+        finally:
+            if ctx is not None:
+                with suppress(Exception):
+                    await ctx.close()
+            self._release_profile_lock(fresh_identity.key)
+            with suppress(Exception):
+                shutil.rmtree(profile)
 
 
 # 各平台 Cookie 顶域(子域如 creator./edith. 都吃顶域 cookie,一个就够)

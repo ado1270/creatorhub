@@ -160,10 +160,12 @@ def classify_platform_error(
         "限流", "安全验证", "设备异常", "账号异常", "滑块", "人机验证",
         "risk", "captcha", "security verification", "human verification", "verifycenter",
         "website-login/captcha", "rate limit", "too frequent", "http 429",
-        "http 403", "status_code=8",
+        "http 403", "status_code=8", "verification_required",
     )
     if any(marker in text for marker in risk_markers):
-        return RiskCategory.RISK, "platform_risk"
+        return RiskCategory.RISK, ("verification_required"
+                                   if "verification_required" in text
+                                   else "platform_risk")
     return RiskCategory.BUSINESS, "business_error"
 
 

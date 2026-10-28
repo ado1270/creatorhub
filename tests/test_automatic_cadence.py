@@ -199,6 +199,41 @@ def test_direct_collection_execution_respects_deadline_and_state(local_project, 
         assert session.get(KeywordCollectionJob, job_id).status == status
 
 
+def test_collection_verification_is_deferred_instead_of_failed(local_project, monkeypatch):
+    account_id = store(DouyinAccount(
+        status="active", platform="douyin",
+        storage_state=json.dumps({"cookies": [{
+            "name": "sessionid", "value": "fixture",
+            "domain": ".douyin.com", "path": "/",
+        }], "origins": []})))
+    job_id = store(KeywordCollectionJob(
+        account_id=account_id, platform="douyin", status="pending",
+        keywords=json.dumps(["电脑显卡"], ensure_ascii=False)))
+    engine = MonitorEngine(local_project.cfg, local_project.browser)
+
+    async def verification_result(row_id, _account):
+        with db.get_session() as session:
+            job = session.get(KeywordCollectionJob, row_id)
+            job.error_count = 1
+            job.error = "电脑显卡: 抖音搜索接口失败: verification_required"
+            session.add(job); session.commit()
+        return {"canceled": False, "errors": 1, "contents": 0, "comments": 0}
+
+    monkeypatch.setattr(engine.keyword_collector, "run", verification_result)
+
+    result = asyncio.run(engine.run_collection_job(job_id))
+    assert result["ok"] and result["deferred"]
+    assert result["status"] == "pending"
+    assert result["signal"] == "verification_required"
+    with db.get_session() as session:
+        job = session.get(KeywordCollectionJob, job_id)
+        assert job.status == "pending"
+        assert job.current_step == "API 风控冷却，等待重试"
+        assert job.blocked_signal == "verification_required"
+        assert job.next_allowed_at is not None
+        assert job.finished_at is None
+
+
 def test_network_jitter_only_extends_persisted_deadline(local_project):
     account_id = store(DouyinAccount(status="active"))
     engine = MonitorEngine(local_project.cfg, local_project.browser)

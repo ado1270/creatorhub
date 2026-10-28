@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from openpyxl import load_workbook
 from fastapi import HTTPException
@@ -19,6 +19,7 @@ from app.browser.fetcher import (
     _douyin_search_needs_verification,
     douyin_search_empty_error,
     douyin_search_exception_error,
+    decode_douyin_search_payloads,
     extract_search_awemes,
     fetch_douyin_search,
 )
@@ -52,6 +53,26 @@ from app.reporting import build_keyword_collection_report
 
 
 class SearchExtractionTests(unittest.TestCase):
+    def test_douyin_stream_chunks_decode_as_independent_json_payloads(self):
+        first = json.dumps({
+            "data": [{"aweme_info": {
+                "aweme_id": "stream-1",
+                "video": {"play_addr": {}},
+            }}],
+        }, separators=(",", ":")).encode()
+        ack = json.dumps({"ack": 1}, separators=(",", ":")).encode()
+        raw = (f"{len(first):x}\r\n".encode() + first + b"\r\n"
+               + f"{len(ack):x}\r\n".encode() + ack + b"\r\n0\r\n\r\n")
+
+        payloads = decode_douyin_search_payloads(raw)
+
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(extract_search_awemes(payloads[0])[0]["aweme_id"],
+                         "stream-1")
+
+    def test_invalid_douyin_stream_framing_is_ignored(self):
+        self.assertEqual(decode_douyin_search_payloads(b"zz\r\n{}\r\n"), [])
+
     def test_douyin_verify_check_payload_is_detected(self):
         self.assertTrue(_douyin_search_needs_verification({
             "data": [],
@@ -173,6 +194,58 @@ class SearchExtractionTests(unittest.TestCase):
 
 
 class DouyinPageSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_response_body_is_decoded_and_collected(self):
+        payload = json.dumps({"data": [{"aweme_info": {
+            "aweme_id": "stream-result-1",
+            "desc": "流式首屏",
+            "video": {"play_addr": {"url_list": ["https://media.test/1.mp4"]}},
+        }}]}, separators=(",", ":")).encode()
+        framed = (f"{len(payload):x}\r\n".encode() + payload
+                  + b"\r\n0\r\n\r\n")
+
+        class Response:
+            status = 200
+            url = "https://www.douyin.com/aweme/v1/web/general/search/stream/"
+
+            async def json(self):
+                raise ValueError("chunk framed")
+
+            async def body(self):
+                return framed
+
+        class Page:
+            def __init__(self):
+                self.url = "about:blank"
+                self.handler = None
+                self.mouse = SimpleNamespace(wheel=AsyncMock())
+
+            def on(self, event, handler):
+                if event == "response":
+                    self.handler = handler
+
+            async def goto(self, url, **_kwargs):
+                self.url = url
+                await self.handler(Response())
+
+            async def wait_for_load_state(self, *_args, **_kwargs):
+                return None
+
+            async def wait_for_timeout(self, _timeout):
+                return None
+
+            async def close(self):
+                return None
+
+        page = Page()
+        rows, error = await fetch_douyin_search(
+            SimpleNamespace(), SimpleNamespace(), "数码", max_results=1,
+            context=SimpleNamespace(pages=[page]))
+
+        self.assertEqual([row["aweme_id"] for row in rows],
+                         ["stream-result-1"])
+        self.assertEqual(error, "")
+        page.mouse.wheel.assert_not_awaited()
+
     async def test_verification_wait_is_passive_and_page_response_resumes_collection(self):
         verify_payload = {
             "data": [],
@@ -241,7 +314,6 @@ class DouyinPageSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error, "")
         self.assertEqual(page.evaluate_calls, 0)
         self.assertEqual(page.mouse.wheel.await_count, 0)
-
 
 class KeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -344,7 +416,7 @@ class KeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(contents[0].collected_comment_count, 2)
         self.assertEqual(job.content_count, 1)
         self.assertEqual(job.comment_count, 2)
-        self.assertEqual(len(headed_calls), 2)
+        self.assertEqual(headed_calls, [])
 
     async def test_api_mode_does_not_create_a_headed_browser_context(self):
         raw_aweme = {
@@ -405,6 +477,101 @@ class KeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
         client.fetch_all_comments.assert_awaited_once()
         browser_fetch.assert_not_awaited()
 
+    async def test_hybrid_verification_required_never_opens_browser(self):
+        identity = SimpleNamespace(ua="fixture-agent", account_id=self.account.id)
+        fresh_calls = []
+
+        @asynccontextmanager
+        async def temporary_headed_context(value):
+            fresh_calls.append(value)
+            raise AssertionError("verification_required must not open a browser")
+            yield
+
+        browser = SimpleNamespace(
+            identity_for=lambda _account: identity,
+            temporary_headed_context=temporary_headed_context,
+        )
+        cfg = Config()
+        cfg.engine.douyin_read_mode = "hybrid"
+        collector = KeywordCollector(cfg, browser, SimpleNamespace())
+        client = SimpleNamespace(
+            search_awemes=AsyncMock(return_value=([], "verification_required")))
+        job = SimpleNamespace(
+            max_contents_per_keyword=3,
+            max_pages_per_keyword=2,
+            stagnant_pages=1,
+            search_sort="general",
+            publish_time="all",
+            content_type="all",
+            min_likes=0,
+            min_comments=0,
+        )
+        browser_fetch = AsyncMock(side_effect=AssertionError(
+            "verification_required must not fall back to browser search"))
+
+        with patch("app.engine.collection.fetch_douyin_search", browser_fetch):
+            values, error = await collector._discover_douyin(
+                self.account, "电脑显卡", job, client)
+
+        self.assertEqual(values, [])
+        self.assertEqual(error, "抖音搜索接口失败: verification_required")
+        self.assertEqual(fresh_calls, [])
+        client.search_awemes.assert_awaited_once()
+        browser_fetch.assert_not_awaited()
+
+    async def test_hybrid_business_api_failure_can_fall_back_to_browser(self):
+        context = SimpleNamespace()
+        @asynccontextmanager
+        async def temporary_headed_context(_identity):
+            yield context
+
+        browser = SimpleNamespace(
+            identity_for=lambda _account: SimpleNamespace(ua="fixture-agent"),
+            temporary_headed_context=temporary_headed_context)
+        cfg = Config()
+        cfg.engine.douyin_read_mode = "hybrid"
+        collector = KeywordCollector(cfg, browser, SimpleNamespace())
+        client = SimpleNamespace(search_awemes=AsyncMock(
+            return_value=([], "api_rejected:status_code=12345")))
+        job = SimpleNamespace(
+            max_contents_per_keyword=3, max_pages_per_keyword=2, stagnant_pages=1,
+            search_sort="general", publish_time="all", content_type="all",
+            min_likes=0, min_comments=0)
+        browser_rows = [{"aweme_id": "browser-compat-result"}]
+        browser_fetch = AsyncMock(return_value=(browser_rows, ""))
+
+        with patch("app.engine.collection.fetch_douyin_search", browser_fetch):
+            values, error = await collector._discover_douyin(
+                self.account, "电脑显卡", job, client, context=context)
+
+        self.assertEqual(values, browser_rows)
+        self.assertEqual(error, "")
+        client.search_awemes.assert_awaited_once()
+        browser_fetch.assert_awaited_once()
+
+    async def test_hybrid_compatibility_exception_can_fall_back_to_browser(self):
+        browser = SimpleNamespace(
+            identity_for=lambda _account: SimpleNamespace(ua="fixture-agent"))
+        cfg = Config()
+        cfg.engine.douyin_read_mode = "hybrid"
+        collector = KeywordCollector(cfg, browser, SimpleNamespace())
+        client = SimpleNamespace(search_awemes=AsyncMock(
+            side_effect=ValueError("unexpected response shape")))
+        job = SimpleNamespace(
+            max_contents_per_keyword=3, max_pages_per_keyword=2, stagnant_pages=1,
+            search_sort="general", publish_time="all", content_type="all",
+            min_likes=0, min_comments=0)
+        browser_rows = [{"aweme_id": "browser-exception-result"}]
+        browser_fetch = AsyncMock(return_value=(browser_rows, ""))
+
+        with patch("app.engine.collection.fetch_douyin_search", browser_fetch):
+            values, error = await collector._discover_douyin(
+                self.account, "电脑显卡", job, client)
+
+        self.assertEqual(values, browser_rows)
+        self.assertEqual(error, "")
+        browser_fetch.assert_awaited_once()
+
     async def test_browser_mode_comments_never_call_direct_api(self):
         cfg = Config()
         cfg.engine.douyin_read_mode = "browser"
@@ -435,7 +602,7 @@ class KeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
         client.fetch_all_comments.assert_not_awaited()
         browser_fetch.assert_awaited_once()
 
-    async def test_captcha_stops_remaining_keywords_in_same_job(self):
+    async def test_verification_required_stops_remaining_keywords_in_same_job(self):
         with db.get_session() as session:
             job = session.get(KeywordCollectionJob, self.job_id)
             job.keywords = json.dumps(["露营", "穿搭"], ensure_ascii=False)
@@ -454,7 +621,7 @@ class KeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
         cfg.engine.douyin_keyword_gap_seconds = 0
         collector = KeywordCollector(cfg, browser, SimpleNamespace())
         collector._discover_douyin = AsyncMock(return_value=(
-            [], "抖音要求完成滑块验证；本次任务已停止后续请求",
+            [], "抖音搜索接口失败: verification_required",
         ))
 
         result = await collector.run(self.job_id, self.account)
@@ -463,7 +630,7 @@ class KeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["errors"], 1)
         with db.get_session() as session:
             job = session.get(KeywordCollectionJob, self.job_id)
-        self.assertIn("滑块验证", job.error)
+        self.assertIn("verification_required", job.error)
 
 
 class KeywordCollectionEditTests(unittest.TestCase):

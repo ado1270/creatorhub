@@ -47,6 +47,8 @@ from .browser.backends import (
     parse_extra_launch_args,
 )
 from .browser.ip_fingerprint import derive_ip_fingerprint
+from .browser.douyin_auth import douyin_login_prompt_visible
+from .browser.douyin_detail import fetch_douyin_video_detail
 from .browser.runtime_catalog import (
     discover_chromium_runtimes,
     runtime_metadata,
@@ -83,6 +85,7 @@ from .engine import Downloader, MonitorEngine
 from .engine.share_downloader import (
     clean_platform_share_target,
     ShareDownloadError,
+    ShareDownloadFallback,
     ShareDownloader,
     ShareLinkError,
     detect_platform,
@@ -303,6 +306,57 @@ def _persist_native_ua(account_id: int, ua: str) -> None:
         account = session.get(DouyinAccount, account_id)
         if account and account.identity_mode == "native" and account.ua != value:
             account.ua = value
+            session.add(account)
+            session.commit()
+
+
+def _persist_douyin_read_session(identity, profile: dict, state: dict, recipe: dict) -> bool:
+    """Save current browser cookies only after matching authoritative self data.
+
+    A manually completed verification used to update the Chromium profile but
+    leave the direct API using the old database snapshot indefinitely.
+    """
+    from .models import AppSetting
+    from .platforms.douyin.web_session import context_binding, context_key
+
+    with get_session() as session:
+        account = session.get(DouyinAccount, identity.account_id)
+        if not account or account.platform != "douyin" or account.profile_dir != identity.profile_dir:
+            return False
+        comparisons = [str(profile[field]) == str(getattr(account, field))
+                       for field in ("uid", "sec_uid")
+                       if profile.get(field) and getattr(account, field, "")]
+        if not comparisons or not all(comparisons):
+            return False
+        ua = str(recipe.get("ua") or identity.ua or account.ua)
+        binding = context_binding(account, state, ua)
+        if not binding:
+            return False
+        account.storage_state = json.dumps(state, ensure_ascii=False)
+        if account.identity_mode == "native":
+            account.ua = ua
+        session.add(account)
+        if recipe:
+            value = {k: v for k, v in recipe.items() if k != "saved"}
+            value["binding"] = binding
+            key = context_key(account.id)
+            row = session.get(AppSetting, key) or AppSetting(key=key)
+            row.value = json.dumps(value, ensure_ascii=False)
+            session.add(row)
+        # Cookie refresh is not a reason to reset cooldown or mark an account
+        # active: those transitions remain with the existing health/risk logic.
+        session.commit()
+    return True
+
+
+def _persist_douyin_api_cookies(account_id: int, original_state: str, state: dict) -> None:
+    """Keep server cookie rotations, but never overwrite a newer manual login."""
+    if not isinstance(state, dict) or not isinstance(state.get("cookies"), list):
+        return
+    with get_session() as session:
+        account = session.get(DouyinAccount, account_id)
+        if account and account.platform == "douyin" and account.storage_state == original_state:
+            account.storage_state = json.dumps(state, ensure_ascii=False)
             session.add(account)
             session.commit()
 
@@ -541,7 +595,8 @@ async def lifespan(app: FastAPI):
         fingerprint_chromium_platform=(
             cfg.engine.fingerprint_chromium_platform),
         fingerprint_chromium_runtimes=runtime_specs,
-        fingerprint_default_runtime_id=default_runtime_id)
+        fingerprint_default_runtime_id=default_runtime_id,
+        douyin_read_session_callback=_persist_douyin_read_session)
     await browser.start()
     engine = MonitorEngine(cfg, browser)
     startup_now = datetime.utcnow()
@@ -707,7 +762,8 @@ async def _fetch_channels_profile_with_retry(identity, attempts: int = 3) -> tup
 async def _run_account_read(account_id: int, kind: OperationKind, key: str,
                             operation, *, empty_result,
                             unexpected_detail: str = "",
-                            allow_invalid_probe: bool = False):
+                            allow_invalid_probe: bool = False,
+                            interactive_read: bool = False):
     """Run one account-bound API read through the engine's unified gates."""
     if engine is None:
         raise HTTPException(503, "引擎未就绪")
@@ -715,9 +771,12 @@ async def _run_account_read(account_id: int, kind: OperationKind, key: str,
     if unexpected_detail and isinstance(empty_result, dict):
         guarded_empty = dict(empty_result)
         guarded_empty["_guard_error"] = True
+    options = {"allow_invalid_probe": allow_invalid_probe}
+    if interactive_read:
+        options["interactive_read"] = True
     payload, error = await engine.guarded_read_pair(
         account_id, kind, key, operation, empty_result=guarded_empty,
-        allow_invalid_probe=allow_invalid_probe)
+        **options)
     guard_error = False
     if isinstance(payload, dict):
         payload = dict(payload)
@@ -851,12 +910,11 @@ async def _enrich_account_profile(account_id: int, state: str, *,
                             proxy=proxy, **douyin_client_environment(a0))
                         async with client.session_scope():
                             u = await client.fetch_self_profile()
-                            if not u and a0.sec_uid:
-                                u = await client.fetch_profile(a0.sec_uid)
                         err = client.last_error or ("" if u else "empty_response")
                     except Exception as exc:
                         err = exc
-            if not u and mode == "hybrid":
+            auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+            if not u and mode == "hybrid" and not auth_failed:
                 if browser is None:
                     return _done("error", err or "browser_unavailable")
                 u, browser_err = await fetch_self_profile(browser, identity)
@@ -901,8 +959,7 @@ async def _enrich_account_profile(account_id: int, state: str, *,
             acc.status = "active"
             s.add(acc); s.commit()
             return _done("ok")
-        if (err == "logged_out" or
-                getattr(err, "category", None) == RiskCategory.AUTH.value):
+        if classify_platform_error(err)[0] == RiskCategory.AUTH:
             acc.status = "invalid"
             s.add(acc); s.commit()
             return _done("invalid", err or "logged_out")
@@ -4564,6 +4621,9 @@ async def _opened_page_login_state(page, platform: str,
                                    xhs_evidence: dict | None = None) -> str:
     """Classify the opened page without turning transient UI into auth loss."""
     current_url = str(getattr(page, "url", "") or "").lower()
+    if platform == "douyin":
+        visible = await douyin_login_prompt_visible(page)
+        return "logged_out" if visible is True else "unconfirmed"
     if platform == "xhs_creator":
         if "passport" in current_url:
             return "logged_out"
@@ -4683,11 +4743,21 @@ async def open_account_browser(
                     await old_page.goto(
                         home, wait_until="domcontentloaded", timeout=30000)
                 await foreground_page.bring_to_front()
+                reused_login_state = "unconfirmed"
+                if platform == "douyin" and not environment_check:
+                    reused_login_state = await _opened_page_login_state(old_page, platform)
+                    if reused_login_state == "logged_out":
+                        with get_session() as session:
+                            account = session.get(DouyinAccount, account_id)
+                            if account:
+                                account.status = "invalid"
+                                session.add(account)
+                                session.commit()
                 return {
                     "ok": True,
                     "reused": True,
-                    "logged_out": False,
-                    "login_state": "unconfirmed",
+                    "logged_out": reused_login_state == "logged_out",
+                    "login_state": reused_login_state,
                     "login_scope": open_scope,
                     "environment_check_only": environment_check,
                     "environment_check_opened": check_opened,
@@ -5924,6 +5994,68 @@ def _native_aweme_metadata(aweme, source_url: str) -> dict:
     }
 
 
+def _douyin_share_terminal_error(error) -> bool:
+    category, _ = classify_platform_error(error)
+    code = str(error or "")
+    signature_rejected = code.startswith("api_signature:") and code != "api_signature:missing_uifid"
+    return (category in {RiskCategory.AUTH, RiskCategory.RISK}
+            or signature_rejected or code.startswith(("verification_required", "aweme_unavailable")))
+
+
+def _douyin_share_read_error(error, aweme_id: str, *, allow_fallback: bool,
+                             diagnostics: dict | None = None):
+    """Do not describe an empty response as an expired account."""
+    def fail(message: str, error_type=ShareDownloadError):
+        status = (diagnostics or {}).get("http_status")
+        suffix = f"（HTTP {status}）" if isinstance(status, int) and status != 200 else ""
+        exc = error_type(message + suffix)
+        exc.diagnostics = dict(diagnostics or {})
+        raise exc
+
+    category, _ = classify_platform_error(error)
+    code = str(error or "no_detail_response")
+    if code.startswith("api_signature:"):
+        reasons = {
+            "missing_uifid": "账号会话中缺少 API 请求所需的 UIFID，请在账号浏览器打开作品以同步会话",
+            "uifid_not_found": "API 请求的设备标识未被接受",
+            "signature_not_found": "API 请求缺少网页签名",
+            "sign_invalid": "API 请求签名校验失败",
+            "sign_expired": "API 请求签名已过期",
+        }
+        fail(reasons.get(code.split(":", 1)[1], "API 请求签名参数不完整") + "；这不代表账号登录失效")
+    if code.startswith("risk:request_denied:"):
+        fail("抖音拒绝了本次 API 请求；响应尚未明确是会话、签名还是请求限制，请查看诊断信息")
+    if code.startswith("risk:rate_limited:"):
+        fail("抖音暂时限制请求频率，请等待冷却结束后重试")
+    if category == RiskCategory.AUTH:
+        fail("抖音页面或接口明确要求登录，请对所选账号重新登录后再下载")
+    if category == RiskCategory.RISK or code.startswith("verification_required"):
+        fail("抖音要求安全验证或限制当前请求；请在该账号浏览器中完成验证后重试")
+    if code.startswith("aweme_unavailable"):
+        fail("抖音作品不存在、已删除或当前账号没有访问权限")
+    if code == "browser_closed":
+        fail("作品读取期间浏览器被关闭，请重试并保持窗口打开")
+    reasons = {
+        "empty_body": "接口返回空响应（empty_body）",
+        "empty_response": "接口未返回数据（empty_response）",
+        "missing_aweme_detail": "接口未返回目标作品详情",
+        "no_detail_response": "页面未返回目标作品详情",
+        "invalid_json": "接口未返回有效 JSON",
+        "detail_body_unavailable": "页面跳转时详情响应读取失败",
+        "browser_unavailable": "账号浏览器未就绪",
+        "missing_media": "详情中没有可下载的视频或图片",
+        "no_cookie": "账号没有保存可复用的会话 Cookie",
+    }
+    if code.startswith("network:"):
+        reason = "网络请求失败或超时"
+    elif re.fullmatch(r"http_\d{3}|api_rejected:status_code=\d+", code):
+        reason = code
+    else:
+        reason = reasons.get(code, "作品详情读取未成功")
+    error_type = ShareDownloadFallback if allow_fallback else ShareDownloadError
+    fail(f"已识别抖音作品 {aweme_id}，但{reason}", error_type)
+
+
 async def _douyin_native_share(
     source_url: str,
     *,
@@ -5936,53 +6068,133 @@ async def _douyin_native_share(
     proxy: str,
     user_agent: str,
 ) -> dict | None:
-    """用 CreatorHub 自带抖音接口兜底 yt-dlp 尚未支持的 /note/、/slides/。
+    """按读取模式复用所选账号，解析视频、图文和短链。
 
     返回 None 表示它不是可解析的抖音单作品链接，应继续走通用提取器。
     """
     if account_id is None:
         return None
-    aweme_id = await resolve_aweme_id(source_url, user_agent)
-    if not aweme_id:
-        return None
-
     with get_session() as s:
         account = s.get(DouyinAccount, account_id)
         if not account or account.platform != "douyin":
             return None
+        if account.status == "invalid":
+            raise ShareDownloadError("所选抖音账号登录态已失效，请重新登录后再下载")
         state = account.storage_state or account.creator_storage_state or ""
         raw_cookie = account.cookie or ""
+        transport = resolve_transport(cfg, "douyin", "share_download", account)
+        mode = transport["effective_mode"]
+    lease = open_browsers.get(account_id)
+    if lease is not None and getattr(lease, "active", True):
+        raise ShareDownloadError("请先关闭该账号手动打开的浏览器窗口，再执行链接下载")
+    if engine is None:
+        raise ShareDownloadError("账号读取引擎未就绪，请稍后重试")
+
     cookie = douyin_cookie_from_state(state) or raw_cookie
-    client = DouyinClient(cookie, user_agent,
-                          timeout=cfg.engine.request_timeout_seconds,
-                          proxy=proxy,
-                          **douyin_client_environment(account))
-    raw = await client.fetch_video_detail(aweme_id)
+    from .platforms.douyin.web_session import context_key, validated_detail_context
+    api_context = validated_detail_context(
+        get_setting(context_key(account_id), ""), account, state, user_agent)
+    aweme_id = ""
+    used_browser = False
+    download_ua = user_agent
+    api_diagnostics = {}
+
+    async def _read_detail():
+        nonlocal aweme_id, used_browser, download_ua, api_diagnostics
+        aweme_id = await resolve_aweme_id(source_url, user_agent, proxy=proxy) or ""
+        if not aweme_id:
+            return {}, "unresolved_aweme_id"
+        raw, error = None, "no_cookie"
+        # Hybrid defaults to direct API first. The API reuses the account's
+        # calibrated session when available; only inconclusive failures reach
+        # the browser. Explicit authentication/risk denials still stop here.
+        channels = ("browser", "api") if mode == "hybrid" and transport.get(
+            "hybrid_order") == "browser_first" else (
+                ("api", "browser") if mode == "hybrid" else (mode,))
+        for channel in channels:
+            if channel == "api":
+                if not cookie:
+                    continue
+                client = DouyinClient(cookie, user_agent,
+                                      timeout=cfg.engine.request_timeout_seconds,
+                                      proxy=proxy, storage_state=state,
+                                      detail_context=api_context,
+                                      **douyin_client_environment(account))
+                try:
+                    async with client.session_scope():
+                        raw = await client.fetch_video_detail(aweme_id)
+                    api_diagnostics = dict(getattr(client, "last_response", {}) or {})
+                    error = client.last_error or ("" if raw else "empty_response")
+                except Exception as exc:
+                    raw, error = None, f"network:{type(exc).__name__}"
+            elif channel == "browser":
+                if browser is None:
+                    raw, error = None, "browser_unavailable"
+                    continue
+                identity = browser.identity_for(account)
+                from .browser.manager import normalize_proxy
+                if normalize_proxy(proxy) != normalize_proxy(identity.proxy):
+                    return {}, "browser_proxy_mismatch"
+                raw, error = await fetch_douyin_video_detail(
+                    browser, identity, aweme_id, source_url=source_url)
+            else:
+                return {}, "transport_unavailable"
+            if raw and parse_aweme(raw, "highest"):
+                used_browser = channel == "browser"
+                if used_browser:
+                    download_ua = _direct_request_ua(identity)
+                else:
+                    export_state = getattr(client, "export_storage_state", None)
+                    if callable(export_state):
+                        _persist_douyin_api_cookies(account_id, state, export_state())
+                return raw, ""
+            if _douyin_share_terminal_error(error):
+                return {}, error
+        return {}, error or "missing_media"
+
+    raw, outcome = await _run_account_read(
+        account_id, OperationKind.READ_LIGHT, f"share-douyin:{account_id}",
+        _read_detail, empty_result={}, interactive_read=True)
+    if isinstance(outcome, dict):
+        raise ShareDownloadError(f"抖音账号读取已延后：{outcome.get('reason') or '稍后重试'}")
+    if outcome == "browser_proxy_mismatch":
+        raise ShareDownloadError("浏览器读取需使用账号已绑定的代理，请清除下载页的临时代理设置后重试")
+    if not aweme_id and outcome == "unresolved_aweme_id":
+        if mode == "browser":
+            raise ShareDownloadError("未从该链接识别到抖音作品 ID，请复制具体作品的分享链接")
+        return None
+    if outcome:
+        _douyin_share_read_error(outcome, aweme_id, allow_fallback=mode == "hybrid",
+                                 diagnostics=api_diagnostics)
     if not raw:
-        raise ShareDownloadError(
-            "已识别到抖音作品 ID，但所选账号未能读取作品详情；"
-            "请检查账号登录态或更换抖音账号"
-        )
+        _douyin_share_read_error("missing_aweme_detail", aweme_id, allow_fallback=mode == "hybrid",
+                                 diagnostics=api_diagnostics)
     aweme = parse_aweme(raw, quality if quality != "audio" else "highest")
     if not aweme:
-        raise ShareDownloadError("抖音作品详情已读取，但没有找到可下载的视频或图片")
+        _douyin_share_read_error("missing_media", aweme_id, allow_fallback=mode == "hybrid",
+                                 diagnostics=api_diagnostics)
 
     # 原生直链下载器不做音频转码；仅音频请求继续交给 yt-dlp/ffmpeg。
     if quality == "audio" and aweme.media_type == "video":
         return None
 
     metadata = _native_aweme_metadata(aweme, source_url)
+    metadata["read_transport"] = "browser" if used_browser else "api"
+    if not used_browser and api_diagnostics:
+        metadata["api_diagnostics"] = api_diagnostics
+    warnings = (["已使用所选账号的浏览器读取作品详情"]
+                if used_browser and mode == "hybrid" else [])
     if not should_download:
         return {
             "ok": True,
             "url": source_url,
             "metadata": metadata,
-            "warnings": [],
+            "warnings": warnings,
         }
 
     downloader = Downloader(
         str(output_root),
-        user_agent,
+        download_ua,
         timeout=max(30.0, cfg.engine.request_timeout_seconds),
     )
     ok, _local_path, error = await downloader.download_aweme(
@@ -6015,7 +6227,7 @@ async def _douyin_native_share(
         from .browser.manager import normalize_proxy
 
         cover_path = target_dir / f"{aweme.aweme_id}_{title}.cover.jpg"
-        headers = {"User-Agent": user_agent, "Referer": "https://www.douyin.com/"}
+        headers = {"User-Agent": download_ua, "Referer": "https://www.douyin.com/"}
         try:
             async with httpx.AsyncClient(
                 timeout=max(30.0, cfg.engine.request_timeout_seconds),
@@ -6048,7 +6260,7 @@ async def _douyin_native_share(
         "metadata": metadata,
         "files": files,
         "progress": {"status": "finished"},
-        "warnings": [],
+        "warnings": warnings,
     }
 
 
@@ -6267,20 +6479,26 @@ async def share_download(body: ShareDownloadIn):
         results = []
         async with _share_download_sem:
             for link in selected:
+                fallback_error = ""
                 try:
                     item = None
                     if link.platform == "douyin":
-                        item = await _douyin_native_share(
-                            link.url,
-                            account_id=body.account_id,
-                            output_root=output_root,
-                            quality=body.quality,
-                            should_download=body.download,
-                            save_metadata=body.save_metadata,
-                            save_thumbnail=body.save_thumbnail,
-                            proxy=proxy,
-                            user_agent=user_agent,
-                        )
+                        try:
+                            item = await _douyin_native_share(
+                                link.url,
+                                account_id=body.account_id,
+                                output_root=output_root,
+                                quality=body.quality,
+                                should_download=body.download,
+                                save_metadata=body.save_metadata,
+                                save_thumbnail=body.save_thumbnail,
+                                proxy=proxy,
+                                user_agent=user_agent,
+                            )
+                        except ShareDownloadFallback as exc:
+                            # Only inconclusive metadata reads may fall back.
+                            # Auth/risk denials and partial media downloads stop.
+                            fallback_error = str(exc)
                     elif link.platform == "xhs":
                         item = await _xhs_native_share(
                             link.url,
@@ -6310,13 +6528,18 @@ async def share_download(body: ShareDownloadIn):
                             link.url, proxy=proxy, cookie_file=cookie_file
                         )
                     item["input_platform"] = link.platform
+                    if fallback_error:
+                        item.setdefault("warnings", []).append(
+                            fallback_error + "；已改用通用提取器完成处理")
                 except ShareDownloadError as exc:
                     item = {
                         "ok": False,
                         "url": link.url,
                         "input_platform": link.platform,
-                        "error": str(exc),
+                        "error": ((fallback_error + "；通用提取器：") if fallback_error else "") + str(exc),
                     }
+                    if getattr(exc, "diagnostics", None):
+                        item["diagnostics"] = dict(exc.diagnostics)
                 if body.download:
                     try:
                         item["history_id"] = _save_share_download_history(

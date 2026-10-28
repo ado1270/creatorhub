@@ -13,6 +13,13 @@ import uuid
 
 def main():
     executable = Path(sys.argv[1]).resolve()
+    source = Path(__file__).resolve().parents[1]
+    # Check both renderers and the offline guide, not just importability. A stale
+    # local build must not silently ship the previous release's desktop styles.
+    for name in ("index.html", "app.js", "app.css", "icons.svg", "THIRD-PARTY-NOTICES.txt"):
+        bundled = executable.parent / "_internal" / "desktop" / "web" / name
+        assert bundled.read_bytes() == (source / "desktop" / "web" / name).read_bytes(), \
+            f"Frozen desktop asset differs from the current build: {name}"
     with tempfile.TemporaryDirectory(prefix="creatorhub-smoke-") as temp:
         home = Path(temp)
         env = {**os.environ, "CREATORHUB_DESKTOP_HOME": temp, "PYTHONUTF8": "1"}
@@ -57,14 +64,18 @@ def main():
             duplicate = subprocess.run([str(executable), "--serve", "--session", uuid.uuid4().hex,
                                         "--skip-browser-install"], env=env, timeout=15)
             assert duplicate.returncode != 0, "A duplicate frozen service used the same data directory"
-            web = Path(__file__).resolve().parents[1] / "app" / "web"
-            assets = ("app.js", "engine-settings.js", "workbench.js", "workbench.css")
-            for path in ("/", "/health", "/guide/", "/guide/xhs/", "/guide/douyin/",
+            web = source / "app" / "web"
+            assets = ("app.js", "engine-settings.js", "workbench.js", "workbench.css",
+                      "appearance.js", "appearance.css")
+            for path in ("/", "/health", "/guide/", "/guide/xhs/", "/guide/douyin/", "/guide/guide.css",
                          *(f"/static/{name}" for name in assets)):
                 with opener.open(url + path, timeout=5) as response:
                     assert response.status == 200, path
                     if path == "/":
                         assert b'data-guide-base="/guide/"' in response.read()
+                    elif path == "/guide/guide.css":
+                        assert response.read() == (source / "guide" / "guide.css").read_bytes(), \
+                            "Frozen guide stylesheet differs from the current build"
                     elif path.startswith("/static/"):
                         assert response.read() == (web / path.rsplit("/", 1)[1]).read_bytes(), \
                             f"Frozen workbench asset differs from the current build: {path}"

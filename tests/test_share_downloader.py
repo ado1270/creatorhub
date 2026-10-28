@@ -160,6 +160,11 @@ class ShareURLTests(unittest.TestCase):
         self.assertIn("图文作品", message)
         self.assertIn("抖音账号", message)
 
+    def test_douyin_fresh_cookie_error_does_not_claim_login_expired(self):
+        message = _clean_ydl_error("[Douyin] TARGET: Fresh cookies (not necessarily logged in) are needed")
+        self.assertIn("刷新浏览器会话", message)
+        self.assertIn("不一定代表账号失效", message)
+
     def test_audio_format_never_falls_back_to_video_without_ffmpeg(self):
         self.assertEqual(_quality_format("audio", allow_merge=False), "ba")
         self.assertEqual(_download_format_options("audio"), {"format": "ba"})

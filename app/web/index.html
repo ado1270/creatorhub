@@ -2656,6 +2656,8 @@
       <div>
         <label class="check appearance-motion"><input type="checkbox" id="appearance-motion">减少界面动效</label>
         <p class="field-help">简化切换与加载动画；系统的减少动态效果设置始终生效。</p>
+        <label class="check appearance-motion"><input type="checkbox" id="appearance-transparency">减少玻璃透明与模糊</label>
+        <p class="field-help">将顶部栏、导航与浮层切换为高不透明实体表面，兼顾低功耗与更高对比度。</p>
       </div>
     </div>
     <div class="appearance-status"><svg aria-hidden="true"><use href="#i-check"/></svg><span id="appearance-status" role="status" aria-live="polite">偏好自动保存在此浏览器</span></div>
@@ -2802,9 +2804,9 @@
           <div class="form-field">
             <label for="engine-douyin_read_mode">抖音读取方式</label>
             <select id="engine-douyin_read_mode" name="douyin_read_mode" disabled aria-describedby="engine-douyin-read-help">
-              <option value="hybrid">自动选择（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option>
+              <option value="hybrid">API 优先，普通失败浏览器回退（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option>
             </select>
-            <p class="field-help" id="engine-douyin-read-help">影响关键词采集、作品与互动数据读取。自动选择会优先使用稳定方式，并在明确失败时回退。</p>
+            <p class="field-help" id="engine-douyin-read-help">关键词采集先直连 search/single API；普通接口兼容失败才回退浏览器，verification_required/风控时进入冷却且不打开浏览器。通用链接下载仍按所选读取模式执行。</p>
           </div>
           <div class="form-field">
             <label for="engine-monitor_initial_backfill_count">抖音新监控的历史作品数量</label>
@@ -2840,7 +2842,7 @@
           <p class="field-help">控制全局任务轮询和账号闲置保活；单个监控填写了自己的间隔时，以单个监控设置为准。</p>
           <div class="form-grid">
             <div class="form-field"><label for="engine-scan_interval_seconds">全局扫描间隔（秒）</label><input id="engine-scan_interval_seconds" name="scan_interval_seconds" type="number" min="1" max="86400" step="1" required disabled><p class="field-help">仅影响跟随全局间隔的任务，推荐 300 秒（5 分钟）；实际执行仍受任务耗时、错峰和账号限制影响。</p></div>
-            <div class="form-field"><label for="engine-idle_keepalive_hours">账号闲置保活阈值（小时）</label><input id="engine-idle_keepalive_hours" name="idle_keepalive_hours" type="number" min="0" max="168" step="0.5" required disabled><p class="field-help">账号超过该时长未活跃才执行一次保活；0 表示每轮都检查。</p></div>
+            <div class="form-field"><label for="engine-idle_keepalive_hours">历史闲置保活阈值（小时）</label><input id="engine-idle_keepalive_hours" name="idle_keepalive_hours" type="number" min="0" max="168" step="0.5" required disabled><p class="field-help">保留兼容旧配置，不再延迟登录态检查；检查周期以风控设置中的账号体检间隔为准。</p></div>
           </div>
         </div>
       </details>
@@ -2868,7 +2870,7 @@
             <div class="form-field"><label for="engine-comment_max_scrolls">评论区默认翻页次数</label><input id="engine-comment_max_scrolls" name="comment_max_scrolls" type="number" min="1" max="30" step="1" required disabled><p class="field-help">更多翻页会增加耗时；单个监控可单独调整。</p></div>
             <div class="form-field"><label for="engine-xhs_publish_mode">小红书发布方式</label><select id="engine-xhs_publish_mode" name="xhs_publish_mode" disabled><option value="browser">浏览器发布（推荐）</option><option value="api">API 直连（兼容模式）</option></select><p class="field-help">仅影响发布，不改变作品监控的获取方式；原生身份账号仍使用浏览器发布。</p></div>
             <div class="form-field"><label for="engine-xhs_comment_write_mode">小红书评论发送方式</label><select id="engine-xhs_comment_write_mode" name="xhs_comment_write_mode" disabled><option value="browser">浏览器发送（推荐）</option><option value="manual">只保存草稿</option><option value="api">API 直连（兼容模式）</option></select></div>
-            <div class="form-field"><label for="engine-douyin_write_mode">抖音写入方式</label><select id="engine-douyin_write_mode" name="douyin_write_mode" disabled><option value="browser">浏览器写入（推荐）</option><option value="hybrid">API 优先，拒绝时浏览器回退</option><option value="api">API 直连</option></select><p class="field-help">影响评论、回复、关注/取关和已有会话私信；发布作品仍使用创作中心浏览器流程。网络结果不确定时不会重复提交。</p></div>
+            <div class="form-field"><label for="engine-douyin_write_mode">抖音写入方式</label><select id="engine-douyin_write_mode" name="douyin_write_mode" disabled><option value="hybrid">API 优先，明确失败后浏览器回退（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option></select><p class="field-help">影响评论、回复、关注/取关和已有会话私信；发布作品仍使用创作中心浏览器流程。网络结果不确定时不会重复提交或回退。</p></div>
             <div class="form-field"><label class="switch-row" for="engine-comment_browser_headed"><input id="engine-comment_browser_headed" name="comment_browser_headed" type="checkbox" disabled><span class="switch-copy"><b>评论操作显示浏览器窗口</b><span>推荐开启，遇到登录或验证时可以直接处理；关闭后在后台运行。</span></span></label></div>
             <div class="form-field"><label class="switch-row" for="engine-xhs_comment_review_before_publish"><input id="engine-xhs_comment_review_before_publish" name="xhs_comment_review_before_publish" type="checkbox" disabled><span class="switch-copy"><b>小红书评论先审核</b><span>推荐开启。关闭后，新生成的评论可能直接进入发送队列。</span></span></label></div>
           </div>

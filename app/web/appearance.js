@@ -3,7 +3,7 @@
   "use strict";
   const root = document.documentElement;
   const key = "creatorhub-appearance";
-  const defaults = { theme: "system", density: "comfortable", motion: "system" };
+  const defaults = { theme: "system", density: "comfortable", motion: "system", transparency: "system" };
   const media = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-color-scheme: dark)") : null;
   let saved = true;
   function normalize(value) {
@@ -12,6 +12,7 @@
       theme: ["light", "dark", "system"].includes(value.theme) ? value.theme : defaults.theme,
       density: ["comfortable", "compact"].includes(value.density) ? value.density : defaults.density,
       motion: ["system", "reduced"].includes(value.motion) ? value.motion : defaults.motion,
+      transparency: ["system", "reduced"].includes(value.transparency) ? value.transparency : defaults.transparency,
     };
   }
   function read() {
@@ -31,6 +32,8 @@
     document.querySelectorAll('input[name="appearance-density"]').forEach(input => { input.checked = input.value === state.density; });
     const motion = document.getElementById("appearance-motion");
     if (motion) motion.checked = state.motion === "reduced";
+    const transparency = document.getElementById("appearance-transparency");
+    if (transparency && typeof transparency.addEventListener === "function") transparency.checked = state.transparency === "reduced";
     const status = document.getElementById("appearance-status");
     if (status) status.textContent = `${state.theme === "system" ? "跟随系统 · 当前" : "当前"}${state.resolvedTheme === "dark" ? "夜间" : "日间"}主题 · ${saved ? "偏好自动保存在此浏览器" : "已应用于当前页面，浏览器未保存偏好"}`;
   }
@@ -47,6 +50,7 @@
     root.dataset.themeMode = state.theme;
     root.dataset.density = state.density;
     root.dataset.motion = state.motion;
+    root.dataset.transparency = state.transparency;
     root.style.colorScheme = state.resolvedTheme;
     syncBrowserChrome();
     syncControls();
@@ -77,6 +81,10 @@
     });
     const motion = document.getElementById("appearance-motion");
     if (motion) motion.addEventListener("change", () => set({ motion: motion.checked ? "reduced" : "system" }));
+    const transparency = document.getElementById("appearance-transparency");
+    if (transparency && typeof transparency.addEventListener === "function") {
+      transparency.addEventListener("change", () => set({ transparency: transparency.checked ? "reduced" : "system" }));
+    }
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bind, { once: true });
   else bind();

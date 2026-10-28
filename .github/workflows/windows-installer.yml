@@ -80,6 +80,23 @@ jobs:
         run: python -m unittest discover -s tests -p "test_desktop_update*.py"
       - name: Test database upgrades and large follow lists
         run: python -m pytest tests/test_douyin_client.py tests/test_follow_sync.py -q
+      - name: Test account health, Douyin requests and collection exports
+        run: >-
+          python -m pytest
+          tests/test_account_auth_health.py
+          tests/test_douyin_login.py
+          tests/test_douyin_api_session.py
+          tests/test_douyin_web_request_signing.py
+          tests/test_douyin_share_download.py
+          tests/test_douyin_task_browser_cleanup.py
+          tests/test_douyin_comment_sec_uid.py
+          tests/test_keyword_collection.py
+          tests/test_share_downloader.py
+          tests/test_reporting.py
+          tests/test_monitor_metadata.py
+          tests/test_transport_matrix.py
+          tests/test_write_gates.py
+          -q
       - name: Test crash recovery and manual startup
         run: python -m unittest discover -s tests -p test_desktop_lifecycle.py
       - name: Package Python, application and offline guide

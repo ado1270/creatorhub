@@ -38,6 +38,13 @@ class ShareDownloadError(RuntimeError):
     """链接识别或媒体下载失败。"""
 
 
+class ShareDownloadFallback(ShareDownloadError):
+    """Native metadata was inconclusive; a generic extractor may still work.
+
+    Never use this for authentication/verification denials or media-write errors.
+    """
+
+
 @dataclass(frozen=True)
 class ShareURL:
     url: str
@@ -771,6 +778,9 @@ def _clean_ydl_error(message: str) -> str:
     clean = _ANSI_RE.sub("", str(message or "")).strip()
     clean = re.sub(r"(?i)^error:\s*", "", clean)
     lowered = clean.lower()
+    if "fresh cookies" in lowered:
+        return ("抖音要求刷新浏览器会话 Cookie（不一定代表账号失效）；"
+                "请选择抖音账号并使用混合或浏览器读取模式后重试")
     if (
         "unsupported url" in lowered
         and (

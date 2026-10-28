@@ -66,6 +66,24 @@ def test_every_supported_setting_has_a_visual_form_control():
     assert controls == set(EngineSettingsPatch.model_fields)
 
 
+def test_default_douyin_read_mode_is_labeled_api_first():
+    assert EngineConfig().douyin_read_mode == "hybrid"
+    html = (Path(__file__).parents[1] / "app" / "web" / "index.html").read_text(encoding="utf-8")
+    control = html.split('id="engine-douyin_read_mode"', 1)[1].split("</select>", 1)[0]
+    assert '<option value="hybrid">API 优先，普通失败浏览器回退（推荐）</option>' in control
+    help_text = html.split('id="engine-douyin-read-help"', 1)[1].split("</p>", 1)[0]
+    assert "通用链接下载" in help_text
+    assert "verification_required/风控时进入冷却且不打开浏览器" in help_text
+
+
+def test_default_douyin_write_mode_is_labeled_api_first():
+    assert EngineConfig().douyin_write_mode == "hybrid"
+    html = (Path(__file__).parents[1] / "app" / "web" / "index.html").read_text(encoding="utf-8")
+    control = html.split('id="engine-douyin_write_mode"', 1)[1].split("</select>", 1)[0]
+    assert '<option value="hybrid">API 优先，明确失败后浏览器回退（推荐）</option>' in control
+    assert '<option value="api">仅 API，不打开浏览器</option>' in control
+
+
 def test_partial_save_persists_without_changing_the_base_file(local_project):
     cfg = local_project.cfg
     config_file = local_project.root / "base.yaml"

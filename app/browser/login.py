@@ -11,11 +11,12 @@ from urllib.parse import parse_qs, urlparse
 
 from .identity import Identity
 from .manager import BrowserManager
+from .douyin_auth import douyin_login_prompt_visible
 
 _LOG = logging.getLogger(__name__)
 
 # 登录后才会出现的 Cookie(用于判断是否已登录)
-_LOGIN_COOKIES = {"sessionid", "sessionid_ss", "sid_tt", "uid_tt", "sid_guard"}
+_LOGIN_COOKIES = {"sessionid", "sessionid_ss", "sid_tt"}
 
 
 async def _focus(page):
@@ -92,18 +93,12 @@ async def interactive_login(mgr: BrowserManager, identity: Identity,
                 cookies = await ctx.cookies()
             except Exception:
                 break
-            names = {c["name"] for c in cookies}
+            names = {c["name"] for c in cookies if c.get("value")}
             if names & _LOGIN_COOKIES:
                 # Cookie 写入后再确认页面已离开登录态。扫码弹窗尚在时继续等，
                 # 避免平台刚轮换游客/旧 Cookie 就提前结束登录流程。
-                try:
-                    login_visible = await page.get_by_text(
-                        "登录", exact=True).first.is_visible(timeout=500)
-                except Exception:
-                    login_visible = None
-                current_url = str(page.url or "").lower()
-                if login_visible is not True and "passport" not in current_url \
-                        and "/login" not in current_url:
+                login_visible = await douyin_login_prompt_visible(page)
+                if login_visible is False:
                     logged = True
                     break
             # 扫码确认后尽快通知主页面；Cookie 查询很轻量，500ms 足够且比原来的

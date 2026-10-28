@@ -17,16 +17,22 @@ from typing import Any, Iterable
 TRANSPORT_SPECS: tuple[dict[str, Any], ...] = (
     # Douyin reads controlled by douyin_read_mode.
     {"platform": "douyin", "operation": "keyword_collection", "label": "关键词采集",
-     "setting": "douyin_read_mode", "api": True, "browser": True},
+     "setting": "douyin_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "note": "Hybrid 先直连 search/single API；普通兼容性失败可回退浏览器，verification_required/风控时进入冷却且不打开浏览器"},
     {"platform": "douyin", "operation": "public_monitor", "label": "公开作品/评论/弹幕监控",
      "setting": "douyin_read_mode", "api": True, "browser": True},
     {"platform": "douyin", "operation": "account_works", "label": "本账号作品同步",
      "setting": "douyin_read_mode", "api": True, "browser": True},
+    {"platform": "douyin", "operation": "share_download", "label": "通用链接下载详情",
+     "setting": "douyin_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "note": "默认优先 API，普通读取失败时回退账号浏览器；登录失效或安全验证时停止"},
     {"platform": "douyin", "operation": "own_work_comments", "label": "本账号作品评论抓取",
      "setting": "douyin_read_mode", "api": True, "browser": True},
     {"platform": "douyin", "operation": "following_list", "label": "关注列表同步",
      "setting": "douyin_read_mode", "api": True, "browser": True},
-    {"platform": "douyin", "operation": "account_profile", "label": "手动刷新账号资料",
+    {"platform": "douyin", "operation": "account_profile", "label": "账号资料/登录态体检",
      "setting": "douyin_profile_mode", "api": True, "browser": True},
     {"platform": "douyin", "operation": "followers_list", "label": "粉丝列表同步",
      "setting": "douyin_followers_mode", "api": True, "browser": True,
@@ -39,11 +45,14 @@ TRANSPORT_SPECS: tuple[dict[str, Any], ...] = (
      "note": "API 按本账号作品 ID 读取弹幕；浏览器模式保留创作中心流程"},
     # Douyin writes controlled by douyin_write_mode.
     {"platform": "douyin", "operation": "comment_write", "label": "评论/回复发送",
-     "setting": "douyin_write_mode", "api": True, "browser": True},
+     "setting": "douyin_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first"},
     {"platform": "douyin", "operation": "follow_write", "label": "关注/取关",
-     "setting": "douyin_write_mode", "api": True, "browser": True},
+     "setting": "douyin_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first"},
     {"platform": "douyin", "operation": "dm_send", "label": "已有会话私信发送",
-     "setting": "douyin_write_mode", "api": True, "browser": True},
+     "setting": "douyin_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first"},
     {"platform": "douyin", "operation": "publish", "label": "发布作品",
      "setting": "douyin_publish_mode", "api": False, "browser": True,
      "note": "上传鉴权和提交签名仍依赖创作中心页面"},
@@ -120,6 +129,8 @@ def resolve_transport(cfg: Any, platform: str, operation: str,
 
     fallback = (
         "browser_on_confirmed_failure" if effective == "hybrid" else "none")
+    if effective == "hybrid" and spec.get("hybrid_order") == "browser_first":
+        fallback = "api_on_inconclusive_browser_failure"
     return {
         **spec,
         "configured_mode": configured,
@@ -223,7 +234,7 @@ def build_transport_matrix(cfg: Any, accounts: Iterable[Any]) -> dict[str, Any]:
             "douyin_creator_danmaku_mode": _setting_value(
                 cfg, "douyin_creator_danmaku_mode", "hybrid"),
             "douyin_publish_mode": _setting_value(cfg, "douyin_publish_mode", "browser"),
-            "douyin_write_mode": _setting_value(cfg, "douyin_write_mode", "browser"),
+            "douyin_write_mode": _setting_value(cfg, "douyin_write_mode", "hybrid"),
             "xhs_read_mode": _setting_value(cfg, "xhs_read_mode", "browser"),
             "xhs_publish_mode": _setting_value(cfg, "xhs_publish_mode", "browser"),
             "xhs_comment_write_mode": _setting_value(

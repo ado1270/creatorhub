@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import app.db as db
 from app.config import Config, EngineConfig
 from app.engine.monitor import MonitorEngine
+from app.platforms.douyin import DouyinClient
 from app.risk import OperationKind
 from app.models import (
     AccountActionTask,
@@ -439,6 +440,83 @@ class WriteGateTests(unittest.TestCase):
             task = session.get(CommentTask, task_id)
             self.assertEqual(task.status, "done")
             self.assertEqual(task.method, "browser_fallback")
+
+    def test_douyin_hybrid_comment_uses_secure_api_before_page_fallback(self):
+        account_id = self._cookie_account()
+        task_id = self._comment_task(account_id)
+        self.cfg.engine.douyin_write_mode = "hybrid"
+        engine = MonitorEngine(self.cfg, _BrowserStub())
+
+        class FakeClient:
+            def __init__(self, *_args, **_kwargs):
+                self.last_response = {}
+                self.last_error = ""
+                self.last_write_uncertain = False
+
+            @asynccontextmanager
+            async def session_scope(self):
+                yield self
+
+            async def post_comment(self, *_args, **_kwargs):
+                return False, "", "api_requires_browser_security:status_code=8"
+
+            _write_result = DouyinClient._write_result
+
+        secure = AsyncMock(return_value=({
+            "status_code": 0, "comment": {"cid": "secure-comment"},
+        }, "", False))
+        with patch("app.engine.monitor.DouyinClient", FakeClient), \
+                patch("app.engine.monitor.douyin_secure_post_api", secure), \
+                patch("app.engine.monitor.post_comment_browser", AsyncMock(
+                    side_effect=AssertionError("page fallback"))):
+            result = asyncio.run(engine.execute_comment_task(task_id))
+
+        self.assertTrue(result["ok"])
+        secure.assert_awaited_once()
+        self.assertEqual(secure.await_args.args[2],
+                         "/aweme/v1/web/comment/publish/")
+        with db.get_session() as session:
+            task = session.get(CommentTask, task_id)
+            self.assertEqual(task.method, "api_browser_context")
+            self.assertEqual(task.result, "secure-comment")
+
+    def test_douyin_hybrid_secure_api_auth_loss_does_not_click_page(self):
+        account_id = self._cookie_account()
+        task_id = self._action_task(account_id)
+        self.cfg.engine.douyin_write_mode = "hybrid"
+        engine = MonitorEngine(self.cfg, _BrowserStub())
+
+        class FakeClient:
+            def __init__(self, *_args, **_kwargs):
+                self.last_response = {}
+                self.last_error = ""
+                self.last_write_uncertain = False
+
+            @asynccontextmanager
+            async def session_scope(self):
+                yield self
+
+            async def set_follow_state(self, *_args, **_kwargs):
+                return False, "api_requires_browser_security:status_code=8"
+
+            _write_result = DouyinClient._write_result
+
+        secure = AsyncMock(return_value=({
+            "status_code": 8, "status_msg": "用户未登录",
+        }, "", False))
+        with patch("app.engine.monitor.DouyinClient", FakeClient), \
+                patch("app.engine.monitor.douyin_secure_post_api", secure), \
+                patch("app.engine.monitor.do_follow", AsyncMock(
+                    side_effect=AssertionError("page fallback"))):
+            result = asyncio.run(engine.execute_action_task(task_id))
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["error"].startswith("logged_out:"))
+        with db.get_session() as session:
+            account = session.get(DouyinAccount, account_id)
+            task = session.get(AccountActionTask, task_id)
+            self.assertEqual(account.status, "invalid")
+            self.assertEqual(task.method, "api_browser_context")
 
     def test_douyin_api_follow_success_updates_task_without_browser(self):
         account_id = self._cookie_account()

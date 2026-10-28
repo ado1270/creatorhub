@@ -104,9 +104,13 @@ class WindowsReleaseTests(unittest.TestCase):
         for test in ('test_monitor_accounts.py', 'test_monitor_intervals.py', 'test_engine_settings.py', 'test_web_optimizations.py'):
             self.assertIn(test, checks)
         smoke = (ROOT / 'desktop/smoke_windows.py').read_text(encoding='utf-8')
-        for asset in ('app.js', 'engine-settings.js', 'workbench.js', 'workbench.css'):
+        for asset in ('app.js', 'engine-settings.js', 'workbench.js', 'workbench.css',
+                      'appearance.js', 'appearance.css'):
             self.assertIn(f'"{asset}"', smoke)
         self.assertIn('response.read() ==', smoke)
+        self.assertIn('"/guide/guide.css"', smoke)
+        self.assertIn('bundled.read_bytes() ==', smoke)
+        self.assertIn('"desktop" / "web" / name', smoke)
 
     def test_draft_upload_publish_and_rerun_guard(self):
         script = self.jobs['release']['steps'][-1]['run']
@@ -116,6 +120,23 @@ class WindowsReleaseTests(unittest.TestCase):
         self.assertIn('--verify-tag --draft', script)
         self.assertIn('--draft=false', script)
         self.assertIn('CreatorHub-Setup-$APP_VERSION-windows-x64.exe', script)
+
+    def test_account_health_download_and_collection_regressions_gate_packaging(self):
+        steps = self.jobs['windows']['steps']
+        names = [step.get('name', step.get('uses')) for step in steps]
+        gate = 'Test account health, Douyin requests and collection exports'
+        self.assertLess(names.index(gate), names.index('Package Python, application and offline guide'))
+        checks = next(step['run'] for step in steps if step.get('name') == gate)
+        self.assertIn('python -m pytest', checks)
+        for test in ('test_account_auth_health.py', 'test_douyin_login.py',
+                     'test_douyin_api_session.py', 'test_douyin_web_request_signing.py',
+                     'test_douyin_share_download.py', 'test_douyin_task_browser_cleanup.py',
+                     'test_douyin_comment_sec_uid.py', 'test_keyword_collection.py',
+                     'test_share_downloader.py', 'test_reporting.py',
+                     'test_monitor_metadata.py', 'test_transport_matrix.py',
+                     'test_write_gates.py'):
+            self.assertIn(f'tests/{test}', checks)
+            self.assertTrue((ROOT / 'tests' / test).is_file())
 
     def test_runtime_is_verified_and_required(self):
         script = (ROOT / 'desktop/prepare_webview2.ps1').read_text(encoding='utf-8')

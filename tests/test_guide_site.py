@@ -68,6 +68,7 @@ class GuideSiteTests(unittest.TestCase):
             expected = {"index.html", "guide.css"} | {f"images/{name}" for name in GUIDE_IMAGES}
             expected |= {f"{platform}/index.html" for platform in ("douyin", "xhs", "kuaishou", "shipinhao")}
             self.assertEqual(actual, expected)
+            self.assertEqual((target / "guide.css").read_bytes(), (GUIDE / "guide.css").read_bytes())
 
     def test_readme_community_uses_direct_qr_images(self):
         readme = self.parse(ROOT / "README.md")
