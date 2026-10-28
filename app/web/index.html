@@ -661,6 +661,9 @@
   .form-actions .status-text { flex:1 1 220px; margin-right:auto; color:var(--mut); font-size:12px; }
   .form-actions .status-text:empty { display:none; }
   .form-actions .actions-spacer { flex:1 1 24px; }
+  /* 状态文案可能很长，不能把它挤到按钮内部逐字断行 */
+  .form-actions > button { flex-shrink:0; white-space:nowrap; }
+  [data-section="selfcheck"] .form-actions .status-text { flex-basis:100%; }
   .form-note { display:flex; align-items:flex-start; gap:9px; padding:10px 12px; color:var(--mut); background:var(--bg); border:1px solid var(--line-soft); border-radius:var(--r-sm); font-size:11.5px; line-height:1.55; }
   .form-note > svg { width:15px; height:15px; flex:0 0 auto; margin-top:1px; color:var(--info); }
   .form-note.warn { border-color:color-mix(in srgb,var(--warn) 28%,var(--line)); background:var(--warn-soft); }
@@ -2530,6 +2533,31 @@
   </section>
 
   <section data-panel="settings">
+  <div class="card" data-section="selfcheck">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-shield"/></svg></span>
+      <h2>获客链路自检 <span class="sub">交付验收用：查链路有没有悄悄断掉</span></h2>
+    </div>
+    <div class="stack">
+      <p class="field-help">客户买的不是界面，是每天稳定进来的线索。这一项一项查采集账号、
+        监控是否真在跑、线索有没有送进 gdb15、套餐额度还剩多少——
+        链路断了但页面显示正常，是最伤客户的故障。</p>
+      <div class="form-grid cols-auto">
+        <div class="form-field"><label>结论</label><input id="selfcheck-verdict" value="未运行" readonly></div>
+        <div class="form-field"><label>问题项</label><input id="selfcount-fail" value="—" readonly></div>
+        <div class="form-field"><label>注意项</label><input id="selfcount-warn" value="—" readonly></div>
+        <div class="form-field"><label>通过</label><input id="selfcount-pass" value="—" readonly></div>
+      </div>
+      <div id="selfcheck-list" class="stack"></div>
+      <div class="form-actions">
+        <span class="status-text" id="selfcheck-msg" role="status" aria-live="polite"></span>
+        <button class="ghost" onclick="runSelfCheck(false)"><svg><use href="#i-refresh"/></svg>运行自检</button>
+        <button onclick="runSelfCheck(true)"><svg><use href="#i-bolt"/></svg>自检并探测 gdb15</button>
+      </div>
+      <p class="field-help">「探测 gdb15」会向服务端发一次连通性检查：不建线索、不扣额度、不发通知。</p>
+    </div>
+  </div>
+
   <div class="card" data-section="plan">
     <div class="card-head">
       <span class="card-ic"><svg><use href="#i-settings"/></svg></span>

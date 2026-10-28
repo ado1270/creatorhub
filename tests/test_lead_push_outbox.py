@@ -15,6 +15,10 @@ class _Response:
         self.status_code = status_code
         self.text = text
 
+    def json(self):
+        import json
+        return json.loads(self.text)
+
 
 class LeadPushOutboxTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -36,6 +40,64 @@ class LeadPushOutboxTests(unittest.IsolatedAsyncioTestCase):
     def _comments(self):
         return [{"text": "这车多少钱", "comment_id": "cid-1",
                  "create_time": 1_700_000_000}]
+
+    async def test_probe_succeeds_only_when_server_acks_dry_run(self):
+        sent = {}
+
+        async def fake_post(self, url, json=None, headers=None):
+            sent.update(json or {})
+            return _Response(201, '{"ok":true,"dryRun":true}')
+
+        with patch.object(lead_push, "lead_push_settings",
+                          return_value=self.settings), \
+                patch("httpx.AsyncClient.post", new=fake_post):
+            result = await lead_push.probe_lead_push()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(sent["dryRun"])
+        self.assertTrue(sent["commentId"].startswith(lead_push.PROBE_PREFIX))
+        # 探测绝不进暂存箱，否则会被当成真线索反复补推。
+        self.assertEqual(lead_push.outbox_stats()["pending"], 0)
+
+    async def test_probe_against_server_without_dry_run_support_is_not_a_pass(self):
+        """老服务端会把探测当真线索入库，回 201 也不能说「连通正常」。"""
+        async def fake_post(self, url, json=None, headers=None):
+            return _Response(201, '{"id":"lead-1","commentText":"垃圾线索"}')
+
+        with patch.object(lead_push, "lead_push_settings",
+                          return_value=self.settings), \
+                patch("httpx.AsyncClient.post", new=fake_post):
+            result = await lead_push.probe_lead_push()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "old_server")
+
+    async def test_probe_maps_key_and_credit_errors_to_readable_reasons(self):
+        for status, text, reason in (
+                (401, '{"message":"Invalid API key"}', "invalid_key"),
+                (403, '{"message":"Package expired, please renew"}',
+                 "package_expired"),
+                (403, '{"message":"Credit exhausted, please top up"}',
+                 "credit_exhausted")):
+            async def fake_post(self, url, json=None, headers=None,
+                                _s=status, _t=text):
+                return _Response(_s, _t)
+
+            with patch.object(lead_push, "lead_push_settings",
+                              return_value=self.settings), \
+                    patch("httpx.AsyncClient.post", new=fake_post):
+                result = await lead_push.probe_lead_push()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], reason)
+
+    async def test_probe_without_configured_key_does_not_hit_the_network(self):
+        with patch.object(lead_push, "lead_push_settings",
+                          return_value={**self.settings, "api_key": ""}), \
+                patch("httpx.AsyncClient.post",
+                      new=AsyncMock(side_effect=AssertionError("不该发请求"))):
+            result = await lead_push.probe_lead_push()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "unconfigured")
 
     async def test_failed_push_is_stored_in_outbox(self):
         async def fake_post(self, url, json=None, headers=None):

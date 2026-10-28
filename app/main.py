@@ -121,7 +121,9 @@ from .settings import get_setting, set_setting
 from .engine_settings import (EngineSettingsPatch, export_engine_settings,
                               load_persisted_engine_settings, save_engine_settings)
 from .lead_push import (cleanup_outbox, lead_push_settings, outbox_stats,
-                        push_comment_leads, retry_outbox, validate_lead_push_url)
+                        probe_lead_push, push_comment_leads, retry_outbox,
+                        validate_lead_push_url)
+from .selfcheck import run_selfcheck
 from .license import (effective_status, license_enforced, license_settings,
                       license_loop, verify as verify_license)
 from .quota import monthly_lead_usage
@@ -5535,6 +5537,16 @@ async def lead_push_outbox():
     return outbox_stats()
 
 
+@app.get("/api/selfcheck")
+async def selfcheck(probe: int = 0):
+    """获客链路自检：账号、监控、推送、额度一条一条查。
+
+    probe=1 时额外向 gdb15 发一次 dryRun 探测（不产生线索、不扣额度），
+    默认不发，避免客户只是打开页面就往服务端打请求。
+    """
+    return await run_selfcheck(cfg, probe=bool(probe))
+
+
 @app.post("/api/lead-push/retry")
 async def lead_push_retry():
     """立即补推暂存箱里的线索（修好 API Key 后用）。"""
@@ -5544,15 +5556,9 @@ async def lead_push_retry():
 
 @app.post("/api/settings/lead-push-test")
 async def test_lead_push_settings():
-    settings = lead_push_settings()
-    if not settings["enabled"]:
-        raise HTTPException(400, "请先启用 gdb15 线索自动推送")
-    comment_id = f"creatorhub-test-{int(datetime.now().timestamp())}"
-    result = await push_comment_leads(
-        [{"comment_id": comment_id, "text": "CreatorHub gdb15 推送测试",
-          "create_time": int(datetime.now().timestamp())}],
-        platform="douyin", item_id="creatorhub-test")
-    return {"ok": not result["errors"], **result}
+    # 走探测通道：失败的测试记录不该混进线索暂存箱，
+    # 成功的测试记录也不该留在客户付费的线索池里。
+    return await probe_lead_push()
 
 
 class AiTestIn(BaseModel):

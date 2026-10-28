@@ -478,6 +478,72 @@ def validate_lead_push_url(value: str) -> str:
     return value
 
 
+# 探测用的评论 ID 前缀。gdb15 认这个前缀，不会把它当成真线索入库。
+PROBE_PREFIX = "creatorhub-probe-"
+
+
+async def probe_lead_push() -> dict:
+    """往 gdb15 发一次连通性探测，不产生线索、不入暂存箱。
+
+    以前「测试推送」是走正常推送路径发一条假评论。一旦失败，这条假评论
+    会掉进暂存箱被当成真线索反复补推，最后把测试数据推进客户付费的线索池；
+    就算成功，也在 gdb15 里留下一条垃圾线索。现在带 dryRun 标记，
+    服务端只验 Key 和额度，不入库。
+    """
+    settings = lead_push_settings()
+    if not settings["enabled"]:
+        return {"ok": False, "reason": "disabled",
+                "error": "gdb15 自动推送未启用"}
+    if not settings["url"] or not settings["api_key"]:
+        return {"ok": False, "reason": "unconfigured",
+                "error": "gdb15 URL 或 API Key 未配置"}
+    now = int(datetime.now().timestamp())
+    payload = {
+        "platform": "douyin",
+        "sourceUrl": _source_url("douyin", f"{PROBE_PREFIX}{now}"),
+        "commentId": f"{PROBE_PREFIX}{now}",
+        "commentText": "CreatorHub 推送连通性探测",
+        "capturedAt": _captured_at(now),
+        "source": "CREATORHUB",
+        "dryRun": True,
+    }
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0, connect=8.0),
+                follow_redirects=False) as client:
+            await _PUSH_LIMITER.acquire()
+            response = await client.post(
+                settings["url"], json=payload,
+                headers={"x-api-key": settings["api_key"]})
+    except Exception as exc:
+        return {"ok": False, "reason": "network", "error": repr(exc)}
+    status = response.status_code
+    if status in (200, 201, 204, 409):
+        # 只看到 200 就报「连通正常」是不够的：老版本 gdb15 不认识 dryRun，
+        # 会把这次探测当成真线索入库（ValidationPipe 会把未知字段静默丢掉），
+        # 客户每点一次「测试推送」就在付费线索池里多一条垃圾。
+        # 现在要求服务端明确回 dryRun:true 才算通过。
+        try:
+            body = response.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict) and body.get("dryRun"):
+            return {"ok": True, "status": status, "error": ""}
+        return {"ok": False, "reason": "old_server", "status": status,
+                "error": "gdb15 没有确认探测标记，这条探测可能被当成真线索入库了，"
+                         "请升级 gdb15 服务端后再测试"}
+    reason = {401: "invalid_key", 403: "denied", 404: "not_found"}.get(
+        status, "server_error")
+    if status == 403:
+        body = response.text or ""
+        if "expired" in body.lower():
+            reason = "package_expired"
+        elif "credit" in body.lower():
+            reason = "credit_exhausted"
+    return {"ok": False, "reason": reason, "status": status,
+            "error": f"HTTP {status}: {(response.text or '')[:180]}"}
+
+
 async def push_comment_leads(
     comments: list[dict],
     *,

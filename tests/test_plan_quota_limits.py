@@ -122,6 +122,22 @@ class LeadQuotaTests(PlanLimitTestBase):
         with db.get_session() as session:
             self.assertEqual(monthly_lead_usage(session), 2)
 
+    def test_own_account_comment_archive_does_not_burn_quota(self):
+        """watch_id=0 是「本账号作品评论」的本地留档，不是获客线索。
+
+        客户在自己作品下回复粉丝时也会往 commentrecord 写数据，早先它们
+        和评论监控共用一套统计，多看几眼自己作品的评论就把月额度烧光了。
+        """
+        self._add_comment("c-1", "watch")
+        with db.get_session() as session:
+            for cid in ("own-1", "own-2", "own-3"):
+                session.add(CommentRecord(platform="douyin", watch_id=0,
+                                          aweme_id="my-own-work",
+                                          comment_id=cid, text="收到，谢谢"))
+            session.commit()
+        with db.get_session() as session:
+            self.assertEqual(monthly_lead_usage(session), 1)
+
     def test_collection_is_trimmed_to_the_remaining_quota(self):
         self.cfg.plan.monthly_lead_records = 2
         self._add_comment("c-1", "watch")

@@ -26,7 +26,11 @@ def monthly_lead_usage(session) -> int:
     """本月已占用的线索额度（评论监控 + 关键词采集，按线索去重）。"""
     since = utc_month_start()
     watched = select(CommentRecord.platform, CommentRecord.comment_id).where(
-        CommentRecord.created_at >= since)
+        CommentRecord.created_at >= since,
+        # watch_id=0 是「本账号作品评论」的本地留档（客户在自己作品下回复粉丝用），
+        # 不是获客线索，也不会有人推给 gdb15。之前它和评论监控共用一张表就被一起
+        # 算进月额度：客户多看几次自己作品的评论，套餐额度白白烧光。
+        CommentRecord.watch_id.is_distinct_from(0))
     # 关键词采集入库的评论里只有命中线索过滤规则的才算线索，
     # 其余只是采集留档，不占用月线索额度。
     collected = select(

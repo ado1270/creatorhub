@@ -4442,6 +4442,7 @@ async function loadSettings() {
   } catch (e) {}
   loadLicenseStatus();
   loadLeadPushOutbox();
+  loadSelfCheck();
   try {
     const s = await api("/api/settings");
     const assign = (id, property, value) => {
@@ -4542,12 +4543,25 @@ async function testLeadPushSettings() {
   await withBusy(evtBtn(), "测试中", async () => {
     try {
       const result = await api("/api/settings/lead-push-test", { method: "POST" });
+      // 探测接口：不建线索、不扣额度，所以这里不再汇报「新增几条」。
+      const why = {
+        disabled: "请先启用 gdb15 自动推送",
+        unconfigured: "API Key 或推送地址没填",
+        invalid_key: "API Key 无效，请到 gdb15 后台重新复制",
+        package_expired: "gdb15 套餐已到期",
+        credit_exhausted: "gdb15 线索额度已用完",
+        not_found: "推送地址不对（gdb15 找不到该接口）",
+        old_server: "gdb15 服务端版本过旧，不支持连通探测",
+        network: "连不上 gdb15，检查网络或代理",
+        server_error: "gdb15 返回异常",
+      }[result.reason] || "";
       if (result.ok) {
-        $("lead-push-msg").textContent = `推送成功，新增 ${result.pushed || 0} 条`;
+        $("lead-push-msg").textContent = "gdb15 连通正常（未创建测试线索）";
         toast("gdb15 推送连通正常 ✓", "ok");
       } else {
-        $("lead-push-msg").textContent = result.errors?.[0] || "推送失败";
-        toast("gdb15 推送测试失败", "err");
+        $("lead-push-msg").textContent = (why || "推送测试失败")
+          + (result.error ? "：" + String(result.error).slice(0, 120) : "");
+        toast(why || "gdb15 推送测试失败", "err");
       }
     } catch (e) {
       $("lead-push-msg").textContent = "测试失败: " + e.message;
@@ -4555,6 +4569,70 @@ async function testLeadPushSettings() {
     }
   });
 }
+
+const SELFCHECK_PILL = { pass: "done", warn: "pending", fail: "failed", info: "skipped" };
+const SELFCHECK_TEXT = { pass: "通过", warn: "注意", fail: "不通过", info: "说明" };
+let _selfCheckRan = false;
+// 打开设置页时静默跑一次（不碰 gdb15，只查本机链路），
+// 让「线索根本没送出去」这类问题不用客户主动去点才能发现。
+async function loadSelfCheck() {
+  if (_selfCheckRan) return;
+  _selfCheckRan = true;
+  try {
+    renderSelfCheck(await api("/api/selfcheck"));
+    const stamp = ($("selfcheck-verdict") || {}).value || "";
+    if ($("selfcheck-msg") && stamp) {
+      $("selfcheck-msg").textContent = "打开设置页时自动自检：" + stamp;
+    }
+  } catch (e) { _selfCheckRan = false; }
+}
+async function runSelfCheck(probe) {
+  const msg = $("selfcheck-msg");
+  _selfCheckRan = true;
+  msg.textContent = probe ? "自检中（含 gdb15 探测）…" : "自检中…";
+  await withBusy(evtBtn(), "自检中", async () => {
+    try {
+      const r = await api("/api/selfcheck" + (probe ? "?probe=1" : ""));
+      renderSelfCheck(r);
+      msg.textContent = "最近一次自检：" + (r.generated_at || "").replace("T", " ") + " UTC";
+      const bad = r.summary.fail || 0;
+      toast(bad ? `自检发现 ${bad} 项不通过`
+                 : (r.summary.warn ? `自检通过，${r.summary.warn} 项需要注意` : "自检全部通过"),
+            bad ? "err" : (r.summary.warn ? "info" : "ok"));
+    } catch (e) {
+      msg.textContent = "自检失败: " + e.message;
+      toast("自检失败:" + e.message, "err");
+    }
+  });
+}
+function renderSelfCheck(r) {
+  const s = r.summary || {};
+  if ($("selfcheck-verdict")) {
+    $("selfcheck-verdict").value = s.fail
+      ? `链路有问题（${s.fail} 项不通过）`
+      : (s.warn ? `基本可用（${s.warn} 项需注意）` : "链路正常");
+  }
+  if ($("selfcount-fail")) $("selfcount-fail").value = String(s.fail || 0);
+  if ($("selfcount-warn")) $("selfcount-warn").value = String(s.warn || 0);
+  if ($("selfcount-pass")) $("selfcount-pass").value = String(s.pass || 0);
+  const box = $("selfcheck-list");
+  if (!box) return;
+  // 不通过的排前面：客户和运维第一眼就该看到要修的东西。
+  const order = { fail: 0, warn: 1, info: 2, pass: 3 };
+  const items = [...(r.checks || [])].sort(
+    (a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
+  box.innerHTML = items.map((c) => `
+    <div class="collection-comment" style="padding:8px 10px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span class="pill ${SELFCHECK_PILL[c.status] || "skipped"}">${SELFCHECK_TEXT[c.status] || c.status}</span>
+        <b style="font-size:13px">${esc(c.label || c.id)}</b>
+        <span class="mut" style="font-size:11px">${esc(c.group || "")}</span>
+      </div>
+      <p style="margin:6px 0 0;font-size:12.5px">${esc(c.detail || "")}</p>
+      ${c.fix ? `<p style="margin:4px 0 0;font-size:12px" class="mut">怎么做：${esc(c.fix)}</p>` : ""}
+    </div>`).join("");
+}
+
 async function loadLicenseStatus() {
   try {
     const st = await api("/api/license/status");
