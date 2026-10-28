@@ -14,7 +14,15 @@ from datetime import datetime
 from sqlalchemy import func, true, union
 from sqlmodel import select
 
-from .models import CommentRecord, KeywordCollectionComment
+from .models import (
+    CommentRecord,
+    CommentWatch,
+    DanmakuWatch,
+    DouyinAccount,
+    KeywordCollectionComment,
+    KeywordCollectionSchedule,
+    MonitorTarget,
+)
 
 
 def utc_month_start() -> datetime:
@@ -50,3 +58,35 @@ def lead_quota_remaining(session, limit: int | None) -> int | None:
     if limit is None:
         return None
     return max(0, int(limit) - monthly_lead_usage(session))
+
+
+def monitor_slot_usage(session) -> dict:
+    """本机启用的监控位数量。
+
+    作品监控、评论监控、弹幕监控共用「监控位」这一个额度，只统计已启用的：
+    暂停中的监控不消耗平台请求，不该占位。口径集中在这里，套餐校验、页面
+    用量和心跳上报用的是同一个数，否则三处会各说各话。
+    """
+    def count_enabled(model):
+        return int(session.exec(
+            select(func.count(model.id)).where(model.enabled == True)  # noqa: E712
+        ).one() or 0)
+
+    works = count_enabled(MonitorTarget)
+    comments = count_enabled(CommentWatch)
+    danmaku = count_enabled(DanmakuWatch)
+    return {"works": works, "comments": comments, "danmaku": danmaku,
+            "total": works + comments + danmaku}
+
+
+def local_usage_snapshot(session) -> dict:
+    """给 gdb15 心跳用的本机占用摘要。"""
+    slots = monitor_slot_usage(session)
+    accounts = int(session.exec(select(func.count(DouyinAccount.id))).one() or 0)
+    tasks = int(session.exec(
+        select(func.count(KeywordCollectionSchedule.id))).one() or 0)
+    return {
+        "monitorSlotsUsed": slots["total"],
+        "accountsUsed": accounts,
+        "collectionTasks": tasks,
+    }

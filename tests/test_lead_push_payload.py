@@ -64,6 +64,23 @@ class LeadPushPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["nickname"], "张三")
         self.assertEqual(sent[0]["headers"]["x-api-key"], "lk_test")
 
+    async def test_push_headers_carry_instance_id(self):
+        """一个客户可能有多台 CreatorHub 同时推，服务端要分得清是谁推的。"""
+        from app import license as license_module
+        headers = lead_push._push_headers({"api_key": "lk_test"})
+        self.assertEqual(headers["x-api-key"], "lk_test")
+        self.assertEqual(headers["x-instance-id"], license_module.instance_id())
+
+    async def test_push_headers_survive_broken_license_module(self):
+        """取实例标识失败不能挡住推送：线索比诊断坐标重要。"""
+        import sys
+        import types
+        fake = types.ModuleType("app.license")
+        fake.instance_id = lambda: (_ for _ in ()).throw(RuntimeError("locked"))
+        with patch.dict(sys.modules, {"app.license": fake}):
+            headers = lead_push._push_headers({"api_key": "lk_test"})
+        self.assertEqual(headers, {"x-api-key": "lk_test"})
+
     async def test_intent_label_overrides_matched_terms(self):
         sent = []
 

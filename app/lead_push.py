@@ -16,6 +16,23 @@ from .db import get_session
 from .models import LeadPushOutbox
 from .settings import get_setting
 
+
+def _push_headers(settings: dict) -> dict:
+    """推送请求头。
+
+    带上本机实例 ID：一个客户可能有多台 CreatorHub 同时在推，服务端排查
+    「这条线索是哪台机器推的、有没有互相重复」时需要这个坐标。
+    """
+    headers = {"x-api-key": settings["api_key"]}
+    try:
+        from .license import instance_id
+        value = instance_id()
+    except Exception:
+        value = ""
+    if value:
+        headers["x-instance-id"] = value
+    return headers
+
 log = logging.getLogger(__name__)
 
 _MAX_CONCURRENT_PUSHES = 6
@@ -176,7 +193,7 @@ async def send_payloads(payloads: list[dict]) -> tuple[list[dict], list[str]]:
                 try:
                     response = await client.post(
                         settings["url"], json=payload,
-                        headers={"x-api-key": settings["api_key"]})
+                        headers=_push_headers(settings))
                 except Exception as exc:
                     if attempt == 0:
                         await asyncio.sleep(1.0)
@@ -514,7 +531,7 @@ async def probe_lead_push() -> dict:
             await _PUSH_LIMITER.acquire()
             response = await client.post(
                 settings["url"], json=payload,
-                headers={"x-api-key": settings["api_key"]})
+                headers=_push_headers(settings))
     except Exception as exc:
         return {"ok": False, "reason": "network", "error": repr(exc)}
     status = response.status_code

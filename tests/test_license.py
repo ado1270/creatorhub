@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from unittest.mock import patch
+
 from app import db, license
 from app.settings import set_setting
 from app.config import Config, PlanConfig
@@ -24,9 +26,10 @@ class FakeResponse:
 class FakeClient:
     """只实现 license.verify 用到的那部分 httpx 接口。"""
 
-    def __init__(self, response=None, error=None):
+    def __init__(self, response=None, error=None, sink=None):
         self._response = response
         self._error = error
+        self._sink = sink
 
     async def __aenter__(self):
         return self
@@ -37,6 +40,8 @@ class FakeClient:
     async def post(self, *args, **kwargs):
         if self._error is not None:
             raise self._error
+        if self._sink is not None:
+            self._sink.append({"args": args, "kwargs": kwargs})
         return self._response
 
 
@@ -62,9 +67,9 @@ class LicenseTestBase(unittest.TestCase):
 
 
 class LicensePlanTests(LicenseTestBase):
-    def _patch_client(self, response=None, error=None):
+    def _patch_client(self, response=None, error=None, sink=None):
         original = license.httpx.AsyncClient
-        license.httpx.AsyncClient = lambda *a, **k: FakeClient(response, error)
+        license.httpx.AsyncClient = lambda *a, **k: FakeClient(response, error, sink)
         self.addCleanup(
             lambda: setattr(license.httpx, "AsyncClient", original))
 
@@ -160,9 +165,9 @@ class LicensePlanTests(LicenseTestBase):
 class LicenseEnforcementTests(LicenseTestBase):
     """授权一旦生效，就不能靠「关开关 / 改本地配置 / 断网重启」绕过。"""
 
-    def _patch_client(self, response=None, error=None):
+    def _patch_client(self, response=None, error=None, sink=None):
         original = license.httpx.AsyncClient
-        license.httpx.AsyncClient = lambda *a, **k: FakeClient(response, error)
+        license.httpx.AsyncClient = lambda *a, **k: FakeClient(response, error, sink)
         self.addCleanup(
             lambda: setattr(license.httpx, "AsyncClient", original))
 
@@ -226,3 +231,75 @@ class LicenseEnforcementTests(LicenseTestBase):
         status = license.effective_status(self.cfg)
         self.assertFalse(status["enforced"])
         self.assertEqual(status["source"], "local")
+
+
+class LicenseUsageReportTests(LicenseTestBase):
+    """心跳除了拿套餐，还要把本机真实占用报回 gdb15。
+
+    套餐上限是服务端说了算，但「这台机器上到底开了几个监控」只有本地知道。
+    不报上去，客户说被监控位卡住时服务端只能猜。
+    """
+
+    def _patch_client(self, response=None, error=None, sink=None):
+        original = license.httpx.AsyncClient
+        license.httpx.AsyncClient = lambda *a, **k: FakeClient(response, error, sink)
+        self.addCleanup(
+            lambda: setattr(license.httpx, "AsyncClient", original))
+
+    def _seed(self):
+        from app.models import (
+            CommentWatch, DanmakuWatch, DouyinAccount,
+            KeywordCollectionSchedule, MonitorTarget,
+        )
+        with db.get_session() as s:
+            s.add(MonitorTarget(platform="douyin", sec_uid="sec-1", enabled=True))
+            s.add(MonitorTarget(platform="douyin", sec_uid="sec-2", enabled=False))
+            s.add(CommentWatch(platform="douyin", aweme_id="aw-1", enabled=True))
+            s.add(DanmakuWatch(platform="douyin", room_id="room-1", enabled=True))
+            s.add(DouyinAccount(platform="douyin", sec_uid="sec-1"))
+            s.add(KeywordCollectionSchedule(platform="douyin", account_id=1,
+                                           keywords='["二手车"]'))
+            s.commit()
+
+    def test_heartbeat_payload_carries_local_usage(self):
+        self._seed()
+        sink = []
+        self._patch_client(FakeResponse(200, {
+            "status": "active", "plan": {"name": "基础版", "active_monitor_slots": 5},
+        }), sink=sink)
+        import asyncio
+        asyncio.run(license.verify(self.cfg))
+        payload = sink[0]["kwargs"]["json"]
+        self.assertEqual(payload["instanceId"], license.instance_id())
+        self.assertEqual(payload["monitorSlotsUsed"], 3)
+        self.assertEqual(payload["accountsUsed"], 1)
+        self.assertEqual(payload["collectionTasks"], 1)
+
+    def test_paused_monitors_do_not_take_slots(self):
+        """暂停的监控不发请求，不该占位，否则页面报的是假满额。"""
+        self._seed()
+        from app.quota import monitor_slot_usage
+        with db.get_session() as s:
+            usage = monitor_slot_usage(s)
+        self.assertEqual(usage["works"], 1)
+        self.assertEqual(usage["total"], 3)
+
+    def test_heartbeat_reports_installed_version(self):
+        """后台要靠这个数判断谁还停在旧版本，别再把版本报成空的。"""
+        original = license._app_version
+        import types
+        fake = types.ModuleType("desktop.launcher")
+        fake.version = lambda: "0.2.8"
+        import sys
+        with patch.dict(sys.modules, {"desktop.launcher": fake}):
+            self.assertEqual(license._app_version(), "0.2.8")
+        license._app_version = original
+
+    def test_usage_collection_never_breaks_heartbeat(self):
+        """统计拿不到时心跳照发：套餐下发比占用统计重要。"""
+        import app.quota as quota
+        original = quota.local_usage_snapshot
+        quota.local_usage_snapshot = lambda session: (_ for _ in ()).throw(
+            RuntimeError("db locked"))
+        self.addCleanup(setattr, quota, "local_usage_snapshot", original)
+        self.assertEqual(license.collect_usage(), {})

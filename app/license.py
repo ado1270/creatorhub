@@ -220,6 +220,7 @@ async def verify(cfg, *, settings: dict | None = None) -> dict:
         "instanceId": instance_id(),
         "machineCode": machine_code(),
         "appVersion": _app_version(),
+        **collect_usage(),
     }
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
@@ -277,10 +278,38 @@ async def verify(cfg, *, settings: dict | None = None) -> dict:
     }
 
 
+def collect_usage() -> dict:
+    """本机真实占用，随心跳一起上报。
+
+    套餐上限由服务端下发，但「这台机器上实际开了几个监控、绑了几个账号」
+    只有本地知道。不上报的话，客户说「我被监控位卡住了」，服务端只能猜。
+    采集失败就回空字典：心跳的目的是拿套餐，不能因为统计报错把授权流程打断。
+    """
+    try:
+        from .db import get_session
+        from .quota import local_usage_snapshot
+        with get_session() as session:
+            return local_usage_snapshot(session)
+    except Exception:
+        return {}
+
+
 def _app_version() -> str:
+    """客户端版本号，心跳带上去，后台才知道哪些客户还没升级。
+
+    ``app/__init__.py`` 里并没有 ``__version__``，真正的版本号在安装目录的
+    ``desktop-version.txt``（源码运行时是 "source"）。以前只试前者，所以
+    后台看到的 appVersion 一直是空的。
+    """
     try:
         from . import __version__  # type: ignore
-        return str(__version__)
+        if __version__:
+            return str(__version__)[:32]
+    except Exception:
+        pass
+    try:
+        from desktop.launcher import version as _installed_version
+        return str(_installed_version() or "")[:32]
     except Exception:
         return ""
 

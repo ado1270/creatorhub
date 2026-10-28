@@ -129,7 +129,7 @@ from .lead_push import (cleanup_outbox, lead_push_settings, outbox_stats,
 from .selfcheck import run_selfcheck
 from .license import (effective_status, license_enforced, license_settings,
                       license_loop, verify as verify_license)
-from .quota import monthly_lead_usage
+from .quota import local_usage_snapshot, monitor_slot_usage, monthly_lead_usage
 from .quality import rank_works
 from .transport_matrix import (
     build_transport_matrix,
