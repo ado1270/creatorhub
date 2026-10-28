@@ -21,7 +21,8 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 45
+    # Windows runner 上获客链路这批测试实测要 20 分钟以上，45 分钟上限会把打包步骤一起挤掉。
+    timeout-minutes: 90
     env:
       # 确保英文 Windows 构建机也能输出中文说明，并保持子进程编码一致。
       PYTHONUTF8: "1"
