@@ -444,7 +444,7 @@ class Launcher:
         if self.url and (resources() / "desktop-guide").exists():
             webbrowser.open(self.url + "/guide/")
         else:
-            webbrowser.open("https://3441293738.github.io/creatorhub/guide/")
+            webbrowser.open("https://ado1270.github.io/creatorhub/guide/")
 
     def hide(self):
         from tkinter import messagebox

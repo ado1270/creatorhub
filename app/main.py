@@ -11859,7 +11859,7 @@ async def test_channel(cid: int):
 async def index():
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     if os.environ.get("CREATORHUB_DESKTOP") == "1":
-        html = html.replace('data-guide-base="https://3441293738.github.io/creatorhub/guide/"',
+        html = html.replace('data-guide-base="https://ado1270.github.io/creatorhub/guide/"',
                             'data-guide-base="/guide/"')
     # Version all local UI assets, including pre-paint appearance boot and CSS.
     try:

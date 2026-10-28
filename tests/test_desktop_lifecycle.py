@@ -56,7 +56,7 @@ class DesktopLifecycleTests(unittest.TestCase):
                     time.sleep(.1)
                 else: self.fail("Service startup timed out")
                 with opener.open(url, timeout=3) as response:
-                    self.assertIn(b'data-guide-base="https://3441293738.github.io/creatorhub/guide/"', response.read())
+                    self.assertIn(b'data-guide-base="https://ado1270.github.io/creatorhub/guide/"', response.read())
                 duplicate = subprocess.run(child_command("--serve", "--session", "b" * 32, "--skip-browser-install"), cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=12)
                 self.assertNotEqual(duplicate.returncode, 0)
                 self.assertFalse((home / "runtime" / ("b" * 32 + ".json")).exists())

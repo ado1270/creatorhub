@@ -17,7 +17,7 @@ from desktop.update_manifest import (MAX_MANIFEST_SIZE, manifest_name, delta_nam
                                     parse_manifest, verify_tree)
 from desktop.update_policy import UpdatePolicy
 
-REPOSITORY = "3441293738/creatorhub"
+REPOSITORY = "ado1270/creatorhub"
 RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 MAX_INSTALLER_SIZE = 2 * 1024 ** 3

@@ -418,7 +418,7 @@ class Controller:
             slug = data.get("platform", "")
             if slug not in {"", "douyin", "xhs", "kuaishou", "shipinhao"}:
                 raise ValueError("请选择有效的平台。")
-            root = self.url + "/guide/" if self.url and (resources() / "desktop-guide").exists() else "https://3441293738.github.io/creatorhub/guide/"
+            root = self.url + "/guide/" if self.url and (resources() / "desktop-guide").exists() else "https://ado1270.github.io/creatorhub/guide/"
             webbrowser.open(root + (slug + "/" if slug else ""))
         elif name == "hide":
             if not self.hide_window:

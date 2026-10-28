@@ -23,7 +23,7 @@ python -m http.server 8081 --bind 127.0.0.1 --directory _site
 沿用 `.github/workflows/pages-preview.yml`，不要再建一个会覆盖相同 Pages 站点的部署工作流。
 将改动提交并推送到 `main` 后，文档、截图和构建脚本的相关变更会触发构建部署；也可手动运行该工作流。
 GitHub 仓库 Settings → Pages 的构建来源应选择 GitHub Actions。
-部署成功后的指南地址为 `https://3441293738.github.io/creatorhub/guide/`。
+部署成功后的指南地址为 `https://ado1270.github.io/creatorhub/guide/`。
 Fork 用户需按自己的 Pages 地址调整 README 入口和指南里的仓库链接。
 
 ## 更新约定

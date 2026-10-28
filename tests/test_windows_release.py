@@ -153,7 +153,7 @@ class WindowsReleaseTests(unittest.TestCase):
 
     def test_user_download_entries(self):
         for name in ('README.md', 'desktop/README.md', 'guide/index.html'):
-            self.assertIn('https://github.com/3441293738/creatorhub/releases/latest',
+            self.assertIn('https://github.com/ado1270/creatorhub/releases/latest',
                           (ROOT / name).read_text(encoding='utf-8'))
 
     def test_independent_updater_is_packaged_and_smoke_tested(self):

@@ -2,7 +2,7 @@
 
 > 本地运行的多平台内容管理面板，支持 **抖音 / 小红书 / 快手 / 视频号**。
 
-[新手使用指南](https://3441293738.github.io/creatorhub/guide/) · [在线预览](https://3441293738.github.io/creatorhub/) · [快速开始](#快速开始) · [平台能力](#平台能力) · [基本使用](#基本使用) · [配置](#配置) · [常见问题](#常见问题) · [交流群](#交流群)
+[新手使用指南](https://ado1270.github.io/creatorhub/guide/) · [在线预览](https://ado1270.github.io/creatorhub/) · [快速开始](#快速开始) · [平台能力](#平台能力) · [基本使用](#基本使用) · [配置](#配置) · [常见问题](#常见问题) · [交流群](#交流群)
 
 > 在线预览由 GitHub Pages 提供，使用脱敏示例数据，仅展示界面与交互；登录、抓取、下载和发布仍需在本地运行。
 
@@ -33,13 +33,13 @@ CreatorHub 使用 Python + FastAPI 提供统一 Web 界面，用于管理账号�
 
 ### Windows 安装版（推荐）
 
-1. 打开 **[Windows 安装包下载页](https://github.com/3441293738/creatorhub/releases/latest)**，在 Assets 中下载 `CreatorHub-Setup-版本-windows-x64.exe`。
+1. 打开 **[Windows 安装包下载页](https://github.com/ado1270/creatorhub/releases/latest)**，在 Assets 中下载 `CreatorHub-Setup-版本-windows-x64.exe`。
 2. 双击安装，使用桌面快捷方式启动。无需自行安装 Python、运行构建命令或下载源码；缺少 WebView2 时安装器会自动联网安装。
 3. 点击“启动本地服务”。首次会自动下载浏览器组件，就绪后打开工作台并登录账号。
 
 适用于 Windows 10/11 x64。安装与首次启动请保持联网。从 v0.2.0 起，安装版默认每天后台检查一次新版本，只提醒、不自动下载。看到提醒后点“一键更新”，下载完成后确认“安装并重启”即可；也可在“偏好设置 → 版本与更新”中关闭自动检查或手动更新。下载支持增量优先、完整包兜底及断点续传，更新保留用户数据。尚无一键更新入口的旧版先“停止并退出”，再手动运行新版安装包。`Source code (zip)` 是源码，不是安装包。
 
-第一次使用？先看 **[图文上手指南](https://3441293738.github.io/creatorhub/guide/)**：从 ZIP 下载、安装启动、账号登录到完成第一个任务，再按需查看各功能操作与常见问题。文档源码和维护方式见 [`guide/`](guide/README.md)，随现有 GitHub Pages 工作流发布。
+第一次使用？先看 **[图文上手指南](https://ado1270.github.io/creatorhub/guide/)**：从 ZIP 下载、安装启动、账号登录到完成第一个任务，再按需查看各功能操作与常见问题。文档源码和维护方式见 [`guide/`](guide/README.md)，随现有 GitHub Pages 工作流发布。
 
 ### 源码运行（开发者 / macOS / Linux）
 
@@ -58,7 +58,7 @@ Windows 安装版用户跳过以下环境安装与命令。
 克隆项目：
 
 ```bash
-git clone https://github.com/3441293738/creatorhub.git
+git clone https://github.com/ado1270/creatorhub.git
 cd creatorhub
 ```
 
@@ -362,13 +362,13 @@ data/
 | 小红书链接解析失败 | 重新复制包含有效 `xsec_token` 的完整链接 |
 | 仅音频仍得到 MP4，或视频没有声音/画质受限 | 重新运行安装命令更新依赖；也可安装系统 ffmpeg 并加入 `PATH` |
 
-仍有问题可提交 [Issue](https://github.com/3441293738/creatorhub/issues)，并附上平台、操作步骤和服务端错误日志。
+仍有问题可提交 [Issue](https://github.com/ado1270/creatorhub/issues)，并附上平台、操作步骤和服务端错误日志。
 
 ## Star History
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/3441293738/creatorhub/star-history/assets/star-history-dark.svg">
-  <img alt="CreatorHub Star History Chart" src="https://raw.githubusercontent.com/3441293738/creatorhub/star-history/assets/star-history.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ado1270/creatorhub/star-history/assets/star-history-dark.svg">
+  <img alt="CreatorHub Star History Chart" src="https://raw.githubusercontent.com/ado1270/creatorhub/star-history/assets/star-history.svg">
 </picture>
 
 ## 使用须知

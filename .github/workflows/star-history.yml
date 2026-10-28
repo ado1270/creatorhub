@@ -19,14 +19,14 @@ concurrency:
 
 jobs:
   update:
-    if: github.repository == '3441293738/creatorhub'
+    if: github.repository == 'ado1270/creatorhub'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Generate and publish charts
-        uses: 3441293738/github-star-chart@a1ca0d0f5487c5ef410df929e255a04a0b540b09
+        uses: ado1270/github-star-chart@a1ca0d0f5487c5ef410df929e255a04a0b540b09
         with:
           theme: creatorhub
           style: card

@@ -12,7 +12,7 @@
 4. 使用“新手向导”选择平台，按登录 → 第一个任务完成操作。
 5. 可最小化到托盘；关闭网页不停止任务。“停止并退出”或关闭管理窗口会确认并停止服务。
 
-从 [最新正式版](https://github.com/3441293738/creatorhub/releases/latest) 的 Assets 下载安装包。仓库 ZIP 是源码，不是安装包。
+从 [最新正式版](https://github.com/ado1270/creatorhub/releases/latest) 的 Assets 下载安装包。仓库 ZIP 是源码，不是安装包。
 
 数据位于 `%LOCALAPPDATA%\CreatorHub\user-data`，与安装目录分开：
 
