@@ -896,6 +896,29 @@ class AccountActionTask(SQLModel, table=True):
     done_at: Optional[datetime] = None
 
 
+class LeadPushOutbox(SQLModel, table=True):
+    """推送失败暂存箱。
+
+    采集到的评论一旦推不出去，gdb15 就永远看不到这些线索，而水位线已经往前
+    推了，重采也不会重来一遍——线索就这么静默丢了。获客系统丢一条线索就是
+    丢一次成交机会，所以失败的推送必须落库，等 Key 修好或网络恢复后补推。
+    """
+
+    __table_args__ = (Index("ix_lead_push_outbox_pending", "status", "next_retry_at"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(default="douyin", index=True)
+    comment_id: str = Field(default="", index=True)
+    item_id: str = Field(default="", index=True)
+    payload_json: str = Field(default="{}")
+    attempts: int = Field(default=0)
+    last_error: str = ""
+    status: str = Field(default="pending", index=True)   # pending | sent
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    next_retry_at: Optional[datetime] = Field(default=None, index=True)
+    sent_at: Optional[datetime] = Field(default=None)
+
+
 class ShareDownloadRecord(SQLModel, table=True):
     """分享链接下载历史。只读作品信息不会写入，实际下载成功或失败都会记录。"""
     id: Optional[int] = Field(default=None, primary_key=True)

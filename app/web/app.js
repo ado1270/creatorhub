@@ -4441,6 +4441,7 @@ async function loadSettings() {
     }
   } catch (e) {}
   loadLicenseStatus();
+  loadLeadPushOutbox();
   try {
     const s = await api("/api/settings");
     const assign = (id, property, value) => {
@@ -4497,6 +4498,42 @@ async function saveLeadPushSettings() {
     } catch (e) {
       $("lead-push-msg").textContent = "失败: " + e.message;
       toast("保存失败:" + e.message, "err");
+    }
+  });
+}
+async function loadLeadPushOutbox() {
+  try {
+    const st = await api("/api/lead-push/outbox");
+    if ($("lead-push-outbox")) {
+      const parts = [];
+      parts.push(st.pending ? `待补推 ${st.pending} 条` : "待补推 0 条");
+      if (st.failed) parts.push(`${st.failed} 条需人工处理`);
+      $("lead-push-outbox").textContent = parts.join("，")
+        + (st.pending || st.failed
+          ? "（推送失败的线索已暂存，修好 API Key 后点「立即补推」）"
+          : "");
+    }
+  } catch (e) {}
+}
+async function retryLeadPush() {
+  $("lead-push-msg").textContent = "补推中…";
+  await withBusy(evtBtn(), "补推中", async () => {
+    try {
+      const r = await api("/api/lead-push/retry", { method: "POST" });
+      await loadLeadPushOutbox();
+      if (r.disabled) {
+        $("lead-push-msg").textContent = "推送开关已关闭，补推未执行";
+        toast("推送开关已关闭", "err");
+        return;
+      }
+      $("lead-push-msg").textContent =
+        `补推完成：成功 ${r.pushed} 条，失败 ${r.failed} 条，剩余 ${r.remaining} 条`;
+      toast(r.failed
+        ? `补推完成，${r.failed} 条仍然失败`
+        : `补推完成，${r.pushed} 条已送达`, r.failed ? "err" : "ok");
+    } catch (e) {
+      $("lead-push-msg").textContent = "补推失败: " + e.message;
+      toast("补推失败:" + e.message, "err");
     }
   });
 }

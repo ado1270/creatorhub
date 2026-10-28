@@ -2693,8 +2693,10 @@
           <p class="field-help">Key 只保存在本机，不会回显。测试会创建一条测试线索。</p>
         </div>
       </div>
+      <p class="field-help" id="lead-push-outbox">待补推线索：0 条</p>
       <div class="form-actions">
         <span class="status-text" id="lead-push-msg" role="status" aria-live="polite"></span>
+        <button class="ghost" onclick="retryLeadPush()"><svg><use href="#i-refresh"/></svg>立即补推</button>
         <button class="ghost" onclick="testLeadPushSettings()"><svg><use href="#i-bolt"/></svg>测试推送</button>
         <button onclick="saveLeadPushSettings()"><svg><use href="#i-check"/></svg>保存推送设置</button>
       </div>

@@ -120,7 +120,8 @@ from .risk_admin import (RiskSettingsError, apply_risk_settings,
 from .settings import get_setting, set_setting
 from .engine_settings import (EngineSettingsPatch, export_engine_settings,
                               load_persisted_engine_settings, save_engine_settings)
-from .lead_push import lead_push_settings, push_comment_leads, validate_lead_push_url
+from .lead_push import (cleanup_outbox, lead_push_settings, outbox_stats,
+                        push_comment_leads, retry_outbox, validate_lead_push_url)
 from .license import (effective_status, license_enforced, license_settings,
                       license_loop, verify as verify_license)
 from .quota import monthly_lead_usage
@@ -153,6 +154,7 @@ _share_download_sem = asyncio.Semaphore(2)
 _follow_sync_jobs: Dict[str, dict] = {}
 _follow_sync_tasks: Dict[str, asyncio.Task] = {}
 _webhook_delivery_task: asyncio.Task | None = None
+_lead_push_retry_task: asyncio.Task | None = None
 
 
 _ACTIVE_LOGIN_STATUSES = {"opening", "waiting", "verification", "persisted"}
@@ -467,7 +469,8 @@ def _seed_browser_runtimes() -> list[dict]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global browser, engine, im_receiver, _webhook_delivery_task, _license_task
+    global browser, engine, im_receiver, _webhook_delivery_task
+    global _license_task, _lead_push_retry_task
     init_db(cfg.db_path)
     try:
         with get_session() as session:
@@ -562,6 +565,23 @@ async def lifespan(app: FastAPI):
                 print(f"[webhook] 事件投递循环异常: {exc!r}")
             await asyncio.sleep(15)
     _webhook_delivery_task = asyncio.create_task(webhook_delivery_loop())
+
+    async def lead_push_retry_loop():
+        # 推送失败的线索存在暂存箱里，条件好了自动补推，别让线索凉在本地。
+        while True:
+            try:
+                await asyncio.sleep(30)
+                stats = outbox_stats()
+                if stats["pending"]:
+                    result = await retry_outbox()
+                    if result["pushed"]:
+                        print(f"[lead_push] 补推 {result['pushed']} 条线索")
+                cleanup_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[lead_push] 补推循环异常: {exc!r}")
+    _lead_push_retry_task = asyncio.create_task(lead_push_retry_loop())
     # 套餐以 gdb15 下发的为准。先同步一次再启动循环，避免用旧额度跑起来。
     try:
         lic = await verify_license(cfg)
@@ -579,6 +599,10 @@ async def lifespan(app: FastAPI):
         _webhook_delivery_task = None
     _license_task.cancel()
     await asyncio.gather(_license_task, return_exceptions=True)
+    if _lead_push_retry_task:
+        _lead_push_retry_task.cancel()
+        await asyncio.gather(_lead_push_retry_task, return_exceptions=True)
+        _lead_push_retry_task = None
     follow_tasks = [task for task in _follow_sync_tasks.values()
                     if not task.done()]
     for task in follow_tasks:
@@ -5503,6 +5527,19 @@ async def put_settings(body: SettingsIn):
     if body.license_api_key:
         set_setting("license_api_key", body.license_api_key.strip())
     return _settings_dict()
+
+
+@app.get("/api/lead-push/outbox")
+async def lead_push_outbox():
+    """待补推的线索数量。数字不为 0 就说明有线索没进 gdb15。"""
+    return outbox_stats()
+
+
+@app.post("/api/lead-push/retry")
+async def lead_push_retry():
+    """立即补推暂存箱里的线索（修好 API Key 后用）。"""
+    result = await retry_outbox(force=True)
+    return {**result, "outbox": outbox_stats()}
 
 
 @app.post("/api/settings/lead-push-test")

@@ -1,5 +1,7 @@
 """Coverage for the gdb15 lead push payload."""
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import asyncio
 
@@ -13,6 +15,20 @@ class _Response:
 
 
 class LeadPushPayloadTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # 推送成功的收尾会更新本地暂存箱的送达回执，需要库已初始化。
+        from app import db
+        self.previous_engine = db._engine
+        self.tmp = tempfile.TemporaryDirectory()
+        db.init_db(str(Path(self.tmp.name) / "payload.db"))
+
+    def tearDown(self):
+        from app import db
+        if db._engine is not None:
+            db._engine.dispose()
+        db._engine = self.previous_engine
+        self.tmp.cleanup()
+
     async def test_payload_carries_source_comment_and_public_author(self):
         sent = []
 
@@ -98,8 +114,12 @@ class LeadPushPayloadTests(unittest.IsolatedAsyncioTestCase):
         post.assert_not_called()
 
 
-    async def test_pushes_are_concurrent(self):
-        """One keyword collection can yield hundreds of comments."""
+    async def test_pushes_stay_concurrent_when_server_is_slow(self):
+        """One keyword collection can yield hundreds of comments.
+
+        推送有全局限速（别把服务商的防 CC 打爆），但限速管的是「每秒发几个」，
+        不是「一次只能一个在飞」——服务端慢的时候要能并发等着。
+        """
         inflight = 0
         peak = 0
 
@@ -107,19 +127,24 @@ class LeadPushPayloadTests(unittest.IsolatedAsyncioTestCase):
             nonlocal inflight, peak
             inflight += 1
             peak = max(peak, inflight)
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.4)
             inflight -= 1
             return _Response()
 
         comments = [{"text": "多少钱", "comment_id": f"c-{i}",
                      "create_time": 1_700_000_000} for i in range(8)]
-        with patch.object(lead_push, "lead_push_settings", return_value={
-            "enabled": True,
-            "url": "https://www.gdb15.com/api/v1/leads/webhook",
-            "api_key": "lk_test",
-        }), patch("httpx.AsyncClient.post", new=fake_post):
-            result = await lead_push.push_comment_leads(
-                comments, platform="douyin", item_id="aweme-1")
+        original = lead_push._PUSH_RATE_PER_SECOND
+        lead_push._PUSH_RATE_PER_SECOND = 20.0
+        try:
+            with patch.object(lead_push, "lead_push_settings", return_value={
+                "enabled": True,
+                "url": "https://www.gdb15.com/api/v1/leads/webhook",
+                "api_key": "lk_test",
+            }), patch("httpx.AsyncClient.post", new=fake_post):
+                result = await lead_push.push_comment_leads(
+                    comments, platform="douyin", item_id="aweme-1")
+        finally:
+            lead_push._PUSH_RATE_PER_SECOND = original
         self.assertEqual(result["pushed"], 8)
         self.assertGreater(peak, 1)
 
