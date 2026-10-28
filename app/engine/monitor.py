@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from sqlmodel import select
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 
 from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        fetch_creator_comments, fetch_danmaku, fetch_creator_danmaku,
@@ -33,6 +33,7 @@ from . import compose
 from ..config import Config
 from ..account_lifecycle import AccountUnavailableError
 from ..db import get_session
+from ..lead_push import push_comment_leads
 from ..platforms.douyin import (parse_aweme, parse_comment, parse_creator_comment,
                        parse_danmaku,
                        parse_self_user, DouyinClient, publish_douyin,
@@ -54,8 +55,8 @@ from ..models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
                       CommentWatch, DanmakuWatch, DanmakuRecord,
                        DouyinAccount, MonitorTarget, AccountRiskState,
                       NotificationChannel, PublishTask, AccountActionTask,
-                       FollowEdge, DmConversation, AccountWork, AccountStatSnapshot,
-                       KeywordCollectionJob)
+                     FollowEdge, DmConversation, AccountWork, AccountStatSnapshot,
+                     KeywordCollectionJob, KeywordCollectionSchedule)
 from ..notifier import notify_all
 from ..operations import record_account_operation
 from ..netfp import probe_ip_region
@@ -67,6 +68,7 @@ from ..risk import (
 )
 from ..settings import get_setting
 from ..transport_matrix import douyin_client_environment, resolve_transport
+from ..quota import monthly_lead_usage
 from .downloader import Downloader
 from .collection import KeywordCollector
 from .dm_automation import XhsDmAutomation
@@ -113,6 +115,28 @@ def _monitor_terms(raw: str) -> list[str]:
             continue
         seen.add(key)
         result.append(term)
+    return result
+
+
+def _load_comment_watermark(watch) -> dict:
+    """每个作品的评论推送水位线：{作品ID: 已处理到的最大评论时间戳}。
+
+    水位线必须单独记，不能只靠「已入库评论」推导：套餐月线索额度用尽时
+    评论不会入库，若水位线跟着入库记录走，同一批评论会在每一轮扫描里被
+    当成新评论反复推送到 gdb15。
+    """
+    try:
+        raw = json.loads(getattr(watch, "comment_watermark", "") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            result[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
     return result
 
 
@@ -744,6 +768,7 @@ class MonitorEngine:
                     await self._process_comment_tasks()
                     await self._process_action_tasks()
                     await self._process_collection_jobs()
+                    await self._process_collection_schedules()
                     next_maintenance_at = time.monotonic() + 15
                 poll_seconds = self._monitor_poll_seconds()
             except Exception as e:
@@ -856,6 +881,116 @@ class MonitorEngine:
             # A held account must not block later jobs on healthy accounts.
             if self.enqueue_collection_job(job.id):
                 break
+
+    @staticmethod
+    def _sync_schedule_status(schedule_id: int, status: str, error: str) -> None:
+        """把一次定时任务的执行结果写回定时配置，便于界面显示最近状态。"""
+        if not schedule_id:
+            return
+        try:
+            with get_session() as s:
+                schedule = s.get(KeywordCollectionSchedule, schedule_id)
+                if not schedule:
+                    return
+                schedule.last_status = status
+                schedule.last_error = (error or "")[:300]
+                s.add(schedule); s.commit()
+        except Exception:
+            log.exception("sync collection schedule status failed for %s", schedule_id)
+
+    async def _process_collection_schedules(self) -> None:
+        """到点的定时关键词任务：新建一次性任务并排队执行。
+
+        风控拦截时不硬顶：连续拦截会拉长周期，连续三次则自动暂停，
+        避免定时任务在账号被限流时持续冲击平台。
+        """
+        now = datetime.utcnow()
+        with get_session() as s:
+            due = s.exec(
+                select(KeywordCollectionSchedule)
+                .where(KeywordCollectionSchedule.enabled == True)  # noqa: E712
+                .where(or_(KeywordCollectionSchedule.next_run_at == None,  # noqa: E711
+                           KeywordCollectionSchedule.next_run_at <= now))
+                .order_by(KeywordCollectionSchedule.id)
+            ).all()
+        for schedule in due:
+            await self._run_collection_schedule(schedule.id, now)
+
+    async def _run_collection_schedule(self, schedule_id: int,
+                                       now: datetime) -> None:
+        with get_session() as s:
+            schedule = s.get(KeywordCollectionSchedule, schedule_id)
+            if not schedule or not schedule.enabled:
+                return
+            account = s.get(DouyinAccount, schedule.account_id)
+            if (not account or account.platform != schedule.platform
+                    or account.status != "active" or not account.storage_state):
+                schedule.last_error = "所选账号不存在、登录态失效或与平台不匹配"
+                schedule.last_status = "failed"
+                schedule.last_run_at = now
+                schedule.next_run_at = now + timedelta(
+                    seconds=schedule.interval_seconds)
+                s.add(schedule); s.commit()
+                return
+            busy = s.exec(
+                select(KeywordCollectionJob.id)
+                .where(KeywordCollectionJob.schedule_id == schedule.id)
+                .where(KeywordCollectionJob.status.in_(["pending", "running"]))
+            ).first()
+            if busy:
+                # 上一轮还没跑完，等它结束再排下一轮。
+                schedule.next_run_at = now + timedelta(
+                    seconds=max(60, schedule.interval_seconds // 4))
+                s.add(schedule); s.commit()
+                return
+            decision = self.risk.preflight(schedule.account_id,
+                                           OperationKind.READ_HEAVY)
+            if not decision.allowed:
+                schedule.consecutive_blocks += 1
+                schedule.last_error = decision.reason or "风控拦截"
+                schedule.last_status = "blocked"
+                if schedule.consecutive_blocks >= 3:
+                    schedule.enabled = False
+                    schedule.last_error = (
+                        f"连续 {schedule.consecutive_blocks} 次被风控拦截，已自动暂停："
+                        f"{schedule.last_error}")
+                else:
+                    backoff = min(
+                        schedule.interval_seconds * (2 ** schedule.consecutive_blocks),
+                        24 * 3600)
+                    schedule.next_run_at = now + timedelta(seconds=backoff)
+                s.add(schedule); s.commit()
+                return
+            schedule.consecutive_blocks = 0
+            schedule.last_error = ""
+            job = KeywordCollectionJob(
+                schedule_id=schedule.id,
+                platform=schedule.platform, account_id=schedule.account_id,
+                source_type="keyword",
+                keywords=schedule.keywords,
+                max_contents_per_keyword=schedule.max_contents_per_keyword,
+                max_pages_per_keyword=schedule.max_pages_per_keyword,
+                stagnant_pages=schedule.stagnant_pages,
+                search_sort=schedule.search_sort,
+                publish_time=schedule.publish_time,
+                content_type=schedule.content_type,
+                min_likes=schedule.min_likes,
+                min_comments=schedule.min_comments,
+                max_comments_per_content=schedule.max_comments_per_content,
+                include_replies=schedule.include_replies,
+                download_media=schedule.download_media,
+                video_quality=schedule.video_quality,
+                download_dir=schedule.download_dir,
+                status="pending", current_step="等待执行")
+            s.add(job); s.flush()
+            schedule.last_job_id = job.id
+            schedule.last_run_at = now
+            schedule.last_status = "queued"
+            schedule.next_run_at = now + timedelta(
+                seconds=schedule.interval_seconds)
+            s.add(schedule); s.commit()
+            job_id = job.id
+        self.enqueue_collection_job(job_id)
 
     async def run_collection_job(self, job_id: int) -> dict:
         """执行一个持久化关键词任务，并维护可恢复的状态机。"""
@@ -990,6 +1125,7 @@ class MonitorEngine:
                 log_job, "completed" if status in {"done", "partial"} else "failed",
                 status, job_error,
                 duration_ms=int((time.monotonic() - started_clock) * 1000))
+            self._sync_schedule_status(log_job.schedule_id, status, job_error)
             return {"ok": status in {"done", "partial"}, "status": status, **result}
         except asyncio.CancelledError:
             with get_session() as s:
@@ -2898,19 +3034,65 @@ class MonitorEngine:
         """fresh: parse_comment 结果(无 aweme_id)。入库 + 按时间水位线推送。"""
         if not fresh:
             return 0
+        settings = self._comment_watch_settings(watch_id)
+        matched = [c for c in fresh if self._comment_watch_matches(c, settings)]
+        if not matched:
+            return 0
+        key = str(aweme_id or "")
         with get_session() as s:
+            watch = s.get(CommentWatch, watch_id)
+            marks = _load_comment_watermark(watch)
             times = s.exec(select(CommentRecord.create_time)
                            .where(CommentRecord.watch_id == watch_id)
                            .where(CommentRecord.aweme_id == aweme_id)).all()
-            prev_max = max([t for t in times if t] or [0])
-            for c in fresh:
+            # 老部署没有水位线，先用已入库评论兜底，避免升级后一次性重推。
+            prev_max = max([int(marks.get(key, 0))]
+                            + [int(t) for t in times if t] + [0])
+        stored = matched
+        lead_limit = getattr(self.cfg.plan, "monthly_lead_records", None)
+        if lead_limit is not None:
+            with get_session() as s:
+                remaining = max(0, int(lead_limit) - monthly_lead_usage(s))
+            if remaining < len(matched):
+                # 额度不够时优先留最新的，线索越新越值钱。
+                ranked = sorted(matched, key=lambda c: int(c.get("create_time") or 0),
+                                reverse=True)
+                allowed = {id(c) for c in ranked[:remaining]}
+                stored = [c for c in matched if id(c) in allowed]
+        # 只推送真正入库的评论，否则月额度只能限制入库、限制不住推送，
+        # 客户可以在 gdb15 里收到远超套餐数量的线索。
+        newer = [c for c in stored if int(c.get("create_time") or 0) > prev_max]
+        with get_session() as s:
+            watch = s.get(CommentWatch, watch_id)
+            for c in stored:
                 s.add(CommentRecord(platform=platform, watch_id=watch_id,
                                     aweme_id=aweme_id, **c))
+            if watch:
+                marks = _load_comment_watermark(watch)
+                if key:
+                    marks[key] = max(
+                        int(marks.get(key, 0)),
+                        max([int(c.get("create_time") or 0) for c in matched] or [0]))
+                    watch.comment_watermark = json.dumps(marks, ensure_ascii=False)
+                s.add(watch)
             s.commit()
-        newer = [c for c in fresh if c["create_time"] > prev_max]
         if not first_scan and newer:
             await self._notify_comments(name, work_desc, newer)
-        return len(fresh)
+            await self._push_comment_leads(platform, aweme_id, newer, settings)
+        return len(stored)
+
+    async def _push_comment_leads(self, platform: str, aweme_id: str,
+                                  comments: list[dict], settings: dict):
+        try:
+            result = await push_comment_leads(
+                comments, platform=platform, item_id=aweme_id,
+                intent_keywords=settings.get("intent_keywords") or [],
+                source_keyword=settings.get("alias") or "")
+            if result.get("errors"):
+                log.warning("gdb15 线索推送失败 %s/%s: %s",
+                            platform, aweme_id, "; ".join(result["errors"]))
+        except Exception as exc:
+            log.warning("gdb15 线索推送异常 %s/%s: %r", platform, aweme_id, exc)
 
     def _comment_watch_settings(self, watch_id: int) -> dict:
         cfg = self.cfg.engine
@@ -2923,7 +3105,42 @@ class MonitorEngine:
                                 or cfg.comment_recent_days),
                 "max_scrolls": ((watch.max_scrolls if watch else 0)
                                 or cfg.comment_max_scrolls),
+                # 监控位名称：推送到 gdb15 时作为线索来源归因。
+                "alias": ((watch.alias if watch else "") or
+                          (watch.title if watch else "") or ""),
+                "comment_max_age_minutes": max(0, int(
+                    getattr(watch, "comment_max_age_minutes", 0) or 0)),
+                "comment_regions": _monitor_terms(
+                    getattr(watch, "comment_regions", "[]") or "[]"),
+                "intent_keywords": _monitor_terms(
+                    getattr(watch, "intent_keywords", "[]") or "[]"),
+                "exclude_keywords": _monitor_terms(
+                    getattr(watch, "exclude_keywords", "[]") or "[]"),
             }
+
+    def _comment_watch_matches(self, comment: dict, settings: dict) -> bool:
+        """Apply lead filters before a captured comment is persisted."""
+        max_age = int(settings.get("comment_max_age_minutes") or 0)
+        create_time = int(comment.get("create_time") or 0)
+        if max_age:
+            if not create_time:
+                return False
+            if max(0, int(time.time())) - create_time > max_age * 60:
+                return False
+        regions = settings.get("comment_regions") or []
+        if regions:
+            location = str(comment.get("ip_label") or "").strip().casefold()
+            if not location or not any(
+                    str(term).casefold() in location for term in regions):
+                return False
+        text = str(comment.get("text") or "").casefold()
+        excludes = settings.get("exclude_keywords") or []
+        if excludes and any(str(term).casefold() in text for term in excludes):
+            return False
+        intents = settings.get("intent_keywords") or []
+        if intents and not any(str(term).casefold() in text for term in intents):
+            return False
+        return True
 
     async def _cw_video(self, watch_id, identity, aweme_id, name, first_scan,
                         api_client=None, work_desc=""):

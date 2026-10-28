@@ -99,7 +99,8 @@ from .models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
                       AccountActionTask, AccountStatSnapshot,
                       ShareDownloadRecord, AccountRiskState, RiskEvent, RiskAdminAudit,
                       KeywordCollectionJob, KeywordCollectionContent,
-                       KeywordCollectionComment, AccountOperationLog,
+                       KeywordCollectionComment, KeywordCollectionSchedule,
+                       AccountOperationLog,
                        GroupConversation, GroupMember, GroupSnapshot,
                        GroupMemberEvent, LiveLead, WebhookSubscription,
                        WebhookEvent)
@@ -119,6 +120,9 @@ from .risk_admin import (RiskSettingsError, apply_risk_settings,
 from .settings import get_setting, set_setting
 from .engine_settings import (EngineSettingsPatch, export_engine_settings,
                               load_persisted_engine_settings, save_engine_settings)
+from .lead_push import lead_push_settings, push_comment_leads, validate_lead_push_url
+from .quota import monthly_lead_usage
+from .quality import rank_works
 from .transport_matrix import (
     build_transport_matrix,
     douyin_client_environment,
@@ -1128,6 +1132,7 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
                 if account_id:
                     acc = s.get(DouyinAccount, acc_id)
                 else:
+                    _require_account_slot(s)
                     acc = DouyinAccount(
                         platform=platform,
                         nickname=(observed_profile.get("nickname")
@@ -1541,6 +1546,7 @@ async def login_cookie(body: CookieIn):
     platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou") else "douyin"
     state = cookie_string_to_state(body.cookie, platform)
     with get_session() as s:
+        _require_account_slot(s)
         acc = DouyinAccount(
             nickname=body.nickname or "Cookie账号", platform=platform,
             identity_mode="native", cookie=body.cookie.strip(), storage_state=state)
@@ -5348,6 +5354,9 @@ class SettingsIn(BaseModel):
     ai_model: str | None = None
     ai_prompt: str | None = None
     ai_temperature: str | None = None
+    lead_push_enabled: bool | None = None
+    lead_push_url: str | None = None
+    lead_push_api_key: str | None = None      # 留空=不修改已保存的 Key
 
 
 def _settings_dict() -> dict:
@@ -5361,6 +5370,10 @@ def _settings_dict() -> dict:
         "ai_temperature": get_setting("ai_temperature", "0.9"),
         # 不回传明文 key,只告知是否已配置
         "ai_api_key_set": bool(get_setting("ai_api_key", "")),
+        "lead_push_enabled": get_setting("lead_push_enabled", "0") == "1",
+        "lead_push_url": get_setting(
+            "lead_push_url", "https://www.gdb15.com/api/v1/leads/webhook"),
+        "lead_push_api_key_set": bool(get_setting("lead_push_api_key", "")),
     }
 
 
@@ -5444,7 +5457,30 @@ async def put_settings(body: SettingsIn):
         set_setting("ai_temperature", (body.ai_temperature or "0.9").strip())
     if body.ai_api_key:    # 仅在传了非空值时更新,留空=保留原 key
         set_setting("ai_api_key", body.ai_api_key.strip())
+    if body.lead_push_enabled is not None:
+        set_setting("lead_push_enabled", "1" if body.lead_push_enabled else "0")
+    if body.lead_push_url is not None:
+        try:
+            url = validate_lead_push_url(body.lead_push_url)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        set_setting("lead_push_url", url)
+    if body.lead_push_api_key:
+        set_setting("lead_push_api_key", body.lead_push_api_key.strip())
     return _settings_dict()
+
+
+@app.post("/api/settings/lead-push-test")
+async def test_lead_push_settings():
+    settings = lead_push_settings()
+    if not settings["enabled"]:
+        raise HTTPException(400, "请先启用 gdb15 线索自动推送")
+    comment_id = f"creatorhub-test-{int(datetime.now().timestamp())}"
+    result = await push_comment_leads(
+        [{"comment_id": comment_id, "text": "CreatorHub gdb15 推送测试",
+          "create_time": int(datetime.now().timestamp())}],
+        platform="douyin", item_id="creatorhub-test")
+    return {"ok": not result["errors"], **result}
 
 
 class AiTestIn(BaseModel):
@@ -6514,6 +6550,11 @@ def _validated_collection_input(body: KeywordCollectionIn) \
             raise HTTPException(400, "请至少填写一个关键词")
         if len(keywords) > 20:
             raise HTTPException(400, "单个任务最多包含 20 个关键词")
+        plan_limit = getattr(cfg.plan, "max_keywords_per_task", None)
+        if plan_limit is not None and len(keywords) > int(plan_limit):
+            raise HTTPException(
+                409,
+                f"当前套餐单个任务最多 {int(plan_limit)} 个关键词，请调整后再保存。")
         if any(len(value) > 80 for value in keywords):
             raise HTTPException(400, "单个关键词不能超过 80 个字符")
     else:
@@ -6953,6 +6994,204 @@ async def update_keyword_collection(job_id: int, body: KeywordCollectionIn):
     return payload
 
 
+class CollectionScheduleIn(KeywordCollectionIn):
+    """定时关键词采集配置：复用一次性任务的全部选项，再加一个周期。"""
+    interval_seconds: int = 3600
+    name: str = ""
+    enabled: bool = True
+
+
+def _collection_schedule_dict(schedule: KeywordCollectionSchedule) -> dict:
+    try:
+        keywords = json.loads(schedule.keywords or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        keywords = []
+    return {
+        "id": schedule.id,
+        "platform": schedule.platform,
+        "account_id": schedule.account_id,
+        "name": schedule.name,
+        "keywords": keywords,
+        "interval_seconds": schedule.interval_seconds,
+        "max_contents_per_keyword": schedule.max_contents_per_keyword,
+        "max_comments_per_content": schedule.max_comments_per_content,
+        "include_replies": schedule.include_replies,
+        "search_sort": schedule.search_sort,
+        "publish_time": schedule.publish_time,
+        "content_type": schedule.content_type,
+        "min_likes": schedule.min_likes,
+        "min_comments": schedule.min_comments,
+        "enabled": schedule.enabled,
+        "last_run_at": (schedule.last_run_at.isoformat()
+                        if schedule.last_run_at else None),
+        "next_run_at": (schedule.next_run_at.isoformat()
+                        if schedule.next_run_at else None),
+        "last_job_id": schedule.last_job_id,
+        "last_status": schedule.last_status,
+        "last_error": schedule.last_error,
+        "consecutive_blocks": schedule.consecutive_blocks,
+        "created_at": schedule.created_at.isoformat() if schedule.created_at else None,
+    }
+
+
+def _validate_schedule_input(body: CollectionScheduleIn):
+    """定时任务只支持关键词来源，并受套餐的任务数与关键词数限制。"""
+    if not 60 <= body.interval_seconds <= 30 * 24 * 3600:
+        raise HTTPException(400, "采集周期须为 60 秒 ~ 30 天")
+    platform, keywords, quality, download_dir, options = \
+        _validated_collection_input(body)
+    if body.source_type != "keyword":
+        raise HTTPException(400, "定时采集仅支持关键词搜索来源")
+    limit = getattr(cfg.plan, "max_keywords_per_task", None)
+    if limit is not None and len(keywords) > int(limit):
+        raise HTTPException(
+            409, f"当前套餐单个任务最多 {int(limit)} 个关键词，请调整后再保存。")
+    return platform, keywords, quality, download_dir, options
+
+
+@app.get("/api/collection-schedules")
+async def list_collection_schedules(platform: str | None = None):
+    with get_session() as s:
+        q = select(KeywordCollectionSchedule)
+        if platform:
+            q = q.where(KeywordCollectionSchedule.platform == platform)
+        rows = s.exec(q.order_by(KeywordCollectionSchedule.id)).all()
+        return [_collection_schedule_dict(row) for row in rows]
+
+
+@app.post("/api/collection-schedules")
+async def create_collection_schedule(body: CollectionScheduleIn):
+    platform, keywords, quality, download_dir, options = \
+        _validate_schedule_input(body)
+    with get_session() as s:
+        account = s.get(DouyinAccount, body.account_id)
+        if (not account or account.platform != platform
+                or account.status != "active" or not account.storage_state):
+            raise HTTPException(400, "所选账号不存在、登录态失效或与平台不匹配")
+        task_limit = getattr(cfg.plan, "max_collection_tasks", None)
+        if task_limit is not None:
+            used = int(s.exec(select(func.count(KeywordCollectionSchedule.id))).one())
+            if used >= int(task_limit):
+                raise HTTPException(
+                    409,
+                    f"当前套餐最多支持 {int(task_limit)} 个定时采集任务，"
+                    "请删除不需要的任务或升级套餐。")
+        now = datetime.utcnow()
+        schedule = KeywordCollectionSchedule(
+            platform=platform, account_id=body.account_id,
+            name=_meta_text(body.name, 60),
+            keywords=json.dumps(keywords, ensure_ascii=False),
+            interval_seconds=body.interval_seconds,
+            max_contents_per_keyword=body.max_contents_per_keyword,
+            max_pages_per_keyword=body.max_pages_per_keyword,
+            stagnant_pages=body.stagnant_pages,
+            search_sort=options["search_sort"],
+            publish_time=options["publish_time"],
+            content_type=options["content_type"],
+            min_likes=options["min_likes"],
+            min_comments=options["min_comments"],
+            max_comments_per_content=body.max_comments_per_content,
+            include_replies=body.include_replies,
+            download_media=body.download_media,
+            video_quality=quality, download_dir=download_dir,
+            enabled=body.enabled,
+            next_run_at=now + timedelta(seconds=body.interval_seconds))
+        s.add(schedule); s.commit(); s.refresh(schedule)
+        payload = _collection_schedule_dict(schedule)
+    record_account_operation(
+        platform=payload["platform"], account_id=payload["account_id"],
+        task_type="collection", task_id=payload["id"], action="scheduled",
+        status="pending", target="、".join(payload["keywords"]), channel="api")
+    return payload
+
+
+@app.put("/api/collection-schedules/{sid}")
+async def update_collection_schedule(sid: int, body: CollectionScheduleIn):
+    platform, keywords, quality, download_dir, options = \
+        _validate_schedule_input(body)
+    with get_session() as s:
+        schedule = s.get(KeywordCollectionSchedule, sid)
+        if not schedule:
+            raise HTTPException(404, "定时采集任务不存在")
+        account = s.get(DouyinAccount, body.account_id)
+        if (not account or account.platform != platform
+                or account.status != "active" or not account.storage_state):
+            raise HTTPException(400, "所选账号不存在、登录态失效或与平台不匹配")
+        schedule.account_id = body.account_id
+        schedule.name = _meta_text(body.name, 60)
+        schedule.keywords = json.dumps(keywords, ensure_ascii=False)
+        schedule.interval_seconds = body.interval_seconds
+        schedule.max_contents_per_keyword = body.max_contents_per_keyword
+        schedule.max_pages_per_keyword = body.max_pages_per_keyword
+        schedule.stagnant_pages = body.stagnant_pages
+        schedule.search_sort = options["search_sort"]
+        schedule.publish_time = options["publish_time"]
+        schedule.content_type = options["content_type"]
+        schedule.min_likes = options["min_likes"]
+        schedule.min_comments = options["min_comments"]
+        schedule.max_comments_per_content = body.max_comments_per_content
+        schedule.include_replies = body.include_replies
+        schedule.download_media = body.download_media
+        schedule.video_quality = quality
+        schedule.download_dir = download_dir
+        schedule.enabled = body.enabled
+        schedule.consecutive_blocks = 0
+        schedule.next_run_at = datetime.utcnow() + timedelta(
+            seconds=body.interval_seconds)
+        s.add(schedule); s.commit(); s.refresh(schedule)
+        return _collection_schedule_dict(schedule)
+
+
+@app.post("/api/collection-schedules/{sid}/run-now")
+async def run_collection_schedule_now(sid: int):
+    """立即触发一次定时采集，并重置下个周期。"""
+    with get_session() as s:
+        schedule = s.get(KeywordCollectionSchedule, sid)
+        if not schedule:
+            raise HTTPException(404, "定时采集任务不存在")
+        account = s.get(DouyinAccount, schedule.account_id)
+        if (not account or account.platform != schedule.platform
+                or account.status != "active" or not account.storage_state):
+            raise HTTPException(400, "所选账号不存在、登录态失效或与平台不匹配")
+        job = KeywordCollectionJob(
+            schedule_id=schedule.id,
+            platform=schedule.platform, account_id=schedule.account_id,
+            source_type="keyword", keywords=schedule.keywords,
+            max_contents_per_keyword=schedule.max_contents_per_keyword,
+            max_pages_per_keyword=schedule.max_pages_per_keyword,
+            stagnant_pages=schedule.stagnant_pages,
+            search_sort=schedule.search_sort, publish_time=schedule.publish_time,
+            content_type=schedule.content_type,
+            min_likes=schedule.min_likes, min_comments=schedule.min_comments,
+            max_comments_per_content=schedule.max_comments_per_content,
+            include_replies=schedule.include_replies,
+            download_media=schedule.download_media,
+            video_quality=schedule.video_quality, download_dir=schedule.download_dir,
+            status="pending", current_step="等待执行")
+        s.add(job); s.flush()
+        schedule.last_job_id = job.id
+        schedule.last_run_at = datetime.utcnow()
+        schedule.last_status = "queued"
+        schedule.next_run_at = datetime.utcnow() + timedelta(
+            seconds=schedule.interval_seconds)
+        s.add(schedule); s.commit(); s.refresh(schedule)
+        payload = _collection_schedule_dict(schedule)
+        job_id = job.id
+    if engine:
+        engine.enqueue_collection_job(job_id)
+    return payload
+
+
+@app.delete("/api/collection-schedules/{sid}")
+async def delete_collection_schedule(sid: int):
+    with get_session() as s:
+        schedule = s.get(KeywordCollectionSchedule, sid)
+        if not schedule:
+            return {"ok": True}
+        s.delete(schedule); s.commit()
+    return {"ok": True}
+
+
 @app.get("/api/collections")
 async def list_keyword_collections(platform: str | None = None, limit: int = 100):
     limit = max(1, min(limit, 300))
@@ -7366,6 +7605,112 @@ def _ensure_creator_monitor_available(session, *, platform: str, sec_uid: str,
         raise HTTPException(409, detail)
 
 
+def _active_monitor_slot_usage(session) -> dict:
+    def count(model):
+        return int(session.exec(
+            select(func.count(model.id)).where(model.enabled == True)  # noqa: E712
+        ).one())
+    works = count(MonitorTarget)
+    comments = count(CommentWatch)
+    danmaku = count(DanmakuWatch)
+    return {"works": works, "comments": comments, "danmaku": danmaku,
+            "total": works + comments + danmaku}
+
+
+def _require_monitor_slot(session, *, adding: bool = False) -> None:
+    """adding=True 表示本次操作会新增一个正在启用的监控位。
+
+    监控位只统计「已启用」的监控，因此新建监控时必须把即将占用的这一位
+    算进去，否则套餐上限会形同虚设。
+    """
+    limit = cfg.plan.active_monitor_slots
+    if limit is None:
+        return
+    usage = _active_monitor_slot_usage(session)
+    projected = usage["total"] + (1 if adding else 0)
+    if projected > limit:
+        raise HTTPException(
+            409,
+            f"当前套餐监控位已满：{usage['total']}/{limit}。"
+            "请暂停其他监控或升级套餐。")
+
+
+def _require_account_slot(session) -> None:
+    limit = cfg.plan.max_accounts
+    if limit is None:
+        return
+    used = int(session.exec(select(func.count(DouyinAccount.id))).one())
+    if used >= limit:
+        raise HTTPException(
+            409,
+            f"当前套餐账号数已满：{used}/{limit}。"
+            "请删除无效账号或升级套餐。")
+
+
+def _monitor_interval_below_plan(value: int, *, allow_follow_global: bool = False) -> bool:
+    minimum = cfg.plan.min_monitor_interval_seconds
+    if minimum is None:
+        return False
+    if value <= 0 and allow_follow_global:
+        # 0 = 跟随全局间隔。全局间隔本身也必须满足套餐下限，
+        # 否则「跟随全局」就成了绕过套餐频率限制的后门。
+        return int(cfg.engine.scan_interval_seconds) < int(minimum)
+    return value < minimum
+
+
+def _plan_interval_error(*, follow_global: bool = False) -> HTTPException:
+    seconds = cfg.plan.min_monitor_interval_seconds
+    if seconds and seconds % 3600 == 0:
+        duration = f"{seconds // 3600} 小时"
+    elif seconds and seconds % 60 == 0:
+        duration = f"{seconds // 60} 分钟"
+    else:
+        duration = f"{seconds} 秒"
+    if follow_global:
+        global_seconds = int(cfg.engine.scan_interval_seconds)
+        global_duration = (f"{global_seconds // 3600} 小时"
+                           if global_seconds % 3600 == 0
+                           else f"{global_seconds // 60} 分钟"
+                           if global_seconds % 60 == 0 else f"{global_seconds} 秒")
+        return HTTPException(
+            409,
+            f"当前套餐监控检查频率不能快于 {duration}，"
+            f"而「跟随全局」实际是 {global_duration}，"
+            f"请直接填写 {duration} 以上的间隔或升级套餐。")
+    return HTTPException(
+        409,
+        f"当前套餐监控检查频率不能快于 {duration}，请调整间隔或升级套餐。")
+
+
+@app.get("/api/plan/usage")
+async def plan_usage():
+    limit = cfg.plan.active_monitor_slots
+    with get_session() as s:
+        usage = _active_monitor_slot_usage(s)
+        account_usage = int(s.exec(select(func.count(DouyinAccount.id))).one())
+        lead_usage = monthly_lead_usage(s)
+    remaining = None if limit is None else max(0, limit - usage["total"])
+    account_remaining = (
+        None if cfg.plan.max_accounts is None
+        else max(0, cfg.plan.max_accounts - account_usage))
+    lead_remaining = (
+        None if cfg.plan.monthly_lead_records is None
+        else max(0, cfg.plan.monthly_lead_records - lead_usage))
+    return {
+        "plan_name": cfg.plan.name or "unlimited",
+        "active_monitor_slots": limit,
+        "monitor_usage": usage,
+        "monitor_remaining": remaining,
+        "max_accounts": cfg.plan.max_accounts,
+        "account_usage": account_usage,
+        "account_remaining": account_remaining,
+        "min_monitor_interval_seconds": cfg.plan.min_monitor_interval_seconds,
+        "monthly_lead_records": cfg.plan.monthly_lead_records,
+        "lead_usage": lead_usage,
+        "lead_remaining": lead_remaining,
+    }
+
+
 @app.post("/api/monitors")
 async def add_monitor(body: TargetIn):
     platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou") else "douyin"
@@ -7397,6 +7742,8 @@ async def add_monitor(body: TargetIn):
     dl = body.download_dir.strip()
     if not 1 <= body.interval_seconds <= 86400:
         raise HTTPException(400, "监控间隔须为 1~86400 秒")
+    if _monitor_interval_below_plan(body.interval_seconds):
+        raise _plan_interval_error()
     if body.media_filter not in ("all", "video", "images"):
         raise HTTPException(400, "媒体筛选须为 all、video 或 images")
     _validate_monitor_strategy(
@@ -7412,6 +7759,7 @@ async def add_monitor(body: TargetIn):
         except Exception as e:
             raise HTTPException(400, f"下载目录不可用: {e}")
     with get_session() as s:
+        _require_monitor_slot(s, adding=True)
         if platform == "douyin":
             if not body.account_id:
                 raise HTTPException(
@@ -7482,6 +7830,8 @@ async def update_monitor(tid: int, body: TargetUpdate):
         if body.interval_seconds is not None:
             if not 1 <= body.interval_seconds <= 86400:
                 raise HTTPException(400, "监控间隔须为 1~86400 秒")
+            if _monitor_interval_below_plan(body.interval_seconds):
+                raise _plan_interval_error()
             t.interval_seconds = body.interval_seconds
         if body.initial_backfill_count is not None:
             if t.last_scan_at is not None:
@@ -7566,6 +7916,8 @@ async def toggle_monitor(tid: int):
         t = s.get(MonitorTarget, tid)
         if not t:
             raise HTTPException(404)
+        if not t.enabled:
+            _require_monitor_slot(s, adding=True)
         t.enabled = not t.enabled
         s.add(t); s.commit()
         return {"enabled": t.enabled}
@@ -8579,10 +8931,15 @@ class WatchIn(BaseModel):
     kind: str = "auto"                  # auto | video(单条视频/笔记) | user(账号/创作者)
     mode: str = "public"               # public | creator(仅抖音 user)
     account_id: int | None = None
+    enabled: bool | None = None         # None=启用；False=先建好再暂停，不占监控位
     interval_seconds: int = 600
     recent_works: int = 0
     recent_days: int = 0
     max_scrolls: int = 0
+    comment_max_age_minutes: int = 300
+    comment_regions: list[str] = PydanticField(default_factory=list)
+    intent_keywords: list[str] = PydanticField(default_factory=list)
+    exclude_keywords: list[str] = PydanticField(default_factory=list)
     alias: str = ""
     group_name: str = ""
     tags: list[str] = PydanticField(default_factory=list)
@@ -8596,6 +8953,10 @@ class WatchUpdate(BaseModel):
     recent_works: int | None = None
     recent_days: int | None = None
     max_scrolls: int | None = None
+    comment_max_age_minutes: int | None = None
+    comment_regions: list[str] | None = None
+    intent_keywords: list[str] | None = None
+    exclude_keywords: list[str] | None = None
     alias: str | None = None
     group_name: str | None = None
     tags: list[str] | None = None
@@ -8611,6 +8972,10 @@ def _watch_dict(w: CommentWatch) -> dict:
         "account_id": w.account_id, "interval_seconds": w.interval_seconds,
         "recent_works": w.recent_works, "recent_days": w.recent_days,
         "max_scrolls": w.max_scrolls,
+        "comment_max_age_minutes": w.comment_max_age_minutes,
+        "comment_regions": _load_meta_tags(w.comment_regions),
+        "intent_keywords": _load_meta_tags(w.intent_keywords),
+        "exclude_keywords": _load_meta_tags(w.exclude_keywords),
         "enabled": w.enabled, "comment_count": w.comment_count,
         "last_scan_at": w.last_scan_at.isoformat() if w.last_scan_at else None,
         "next_auto_run_at": utc_iso(row_deadline(w, cfg, kind="comment_watch")),
@@ -8631,6 +8996,77 @@ async def list_watches(platform: str | None = None):
         return [dict(_watch_dict(w), comment_count=counts.get(w.id, 0)) for w in watches]
 
 
+@app.get("/api/quality-works")
+async def list_quality_works(platform: str | None = None, limit: int = 50):
+    """按获客价值给作品排序，挑出值得加入评论监控的作品。"""
+    return rank_works(platform=platform, limit=limit)
+
+
+class QualityWatchIn(BaseModel):
+    platform: str = "douyin"
+    aweme_id: str
+    interval_seconds: int = 1800
+    comment_max_age_minutes: int = 300
+    comment_regions: list[str] = PydanticField(default_factory=list)
+    intent_keywords: list[str] = PydanticField(default_factory=list)
+    exclude_keywords: list[str] = PydanticField(default_factory=list)
+    alias: str = ""
+    group_name: str = ""
+    tags: list[str] = PydanticField(default_factory=list)
+    account_id: int | None = None
+
+
+@app.post("/api/quality-works/watch")
+async def watch_quality_work(body: QualityWatchIn):
+    """把一条优质作品直接加进评论监控，省去复制链接再解析一遍。"""
+    platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou") \
+        else "douyin"
+    aweme_id = str(body.aweme_id or "").strip()
+    if not aweme_id:
+        raise HTTPException(400, "缺少作品 ID")
+    if not 1 <= body.interval_seconds <= 86400:
+        raise HTTPException(400, "监控间隔须为 1~86400 秒")
+    if not 0 <= body.comment_max_age_minutes <= 10080:
+        raise HTTPException(400, "评论时间范围须为 0~10080 分钟；0 表示不限")
+    if _monitor_interval_below_plan(body.interval_seconds):
+        raise _plan_interval_error()
+    if body.account_id is not None:
+        with get_session() as s:
+            acc = s.get(DouyinAccount, body.account_id)
+            if not acc or acc.platform != platform or acc.status != "active":
+                raise HTTPException(400, "账号不存在、登录态失效或与平台不匹配")
+
+    with get_session() as s:
+        dup = s.exec(select(CommentWatch).where(CommentWatch.platform == platform)
+                     .where(CommentWatch.aweme_id == aweme_id)).first()
+        if dup:
+            raise HTTPException(409, "该作品已在评论监控中")
+        title = ""
+        for model in (KeywordCollectionContent, ContentRecord):
+            row = s.exec(select(model).where(model.platform == platform)
+                        .where(model.aweme_id == aweme_id)
+                        .order_by(model.id.desc())).first()
+            if row:
+                title = (row.desc or "").strip()
+                if title:
+                    break
+        _require_monitor_slot(s, adding=True)
+        w = CommentWatch(
+            platform=platform, kind="video", aweme_id=aweme_id, mode="public",
+            account_id=body.account_id, enabled=True,
+            interval_seconds=body.interval_seconds,
+            title=title[:120],
+            comment_max_age_minutes=body.comment_max_age_minutes,
+            comment_regions=_dump_meta_tags(_meta_tags(body.comment_regions)),
+            intent_keywords=_dump_meta_tags(_meta_tags(body.intent_keywords)),
+            exclude_keywords=_dump_meta_tags(_meta_tags(body.exclude_keywords)),
+            alias=_meta_text(body.alias, 60),
+            group_name=_meta_text(body.group_name, 40),
+            tags=_dump_meta_tags(_meta_tags(body.tags)))
+        s.add(w); s.commit(); s.refresh(w)
+        return _watch_dict(w)
+
+
 @app.post("/api/comment-watches")
 async def add_watch(body: WatchIn):
     platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou") else "douyin"
@@ -8646,6 +9082,8 @@ async def add_watch(body: WatchIn):
         raise HTTPException(400, "近期天数须为 0~365，0 表示跟随全局设置")
     if not 0 <= body.max_scrolls <= 50:
         raise HTTPException(400, "抓取深度须为 0~50，0 表示跟随全局设置")
+    if not 0 <= body.comment_max_age_minutes <= 10080:
+        raise HTTPException(400, "评论时间范围须为 0~10080 分钟；0 表示不限")
     if platform == "xhs":
         kind = body.kind
         if kind == "auto":
@@ -8713,6 +9151,10 @@ async def add_watch(body: WatchIn):
                 raise HTTPException(400, "创作中心模式需要选择一个已“创作者登录”的账号")
 
     with get_session() as s:
+        new_enabled = body.enabled is None or bool(body.enabled)
+        _require_monitor_slot(s, adding=new_enabled)
+        if _monitor_interval_below_plan(body.interval_seconds):
+            raise _plan_interval_error()
         if kind == "video":
             dup = s.exec(select(CommentWatch).where(CommentWatch.platform == platform)
                          .where(CommentWatch.aweme_id == aweme_id)).first()
@@ -8724,10 +9166,18 @@ async def add_watch(body: WatchIn):
             raise HTTPException(409, "已存在相同的评论监控")
         w = CommentWatch(platform=platform, kind=kind, aweme_id=aweme_id, sec_uid=sec_uid,
                           xsec_token=xsec_token, mode=mode, account_id=body.account_id,
+                          enabled=new_enabled,
                           interval_seconds=body.interval_seconds, title=title,
                           recent_works=body.recent_works,
                           recent_days=body.recent_days,
                           max_scrolls=body.max_scrolls,
+                          comment_max_age_minutes=body.comment_max_age_minutes,
+                          comment_regions=_dump_meta_tags(
+                              _meta_tags(body.comment_regions)),
+                          intent_keywords=_dump_meta_tags(
+                              _meta_tags(body.intent_keywords)),
+                          exclude_keywords=_dump_meta_tags(
+                              _meta_tags(body.exclude_keywords)),
                           alias=_meta_text(body.alias, 60),
                           group_name=_meta_text(body.group_name, 40),
                           tags=_dump_meta_tags(_meta_tags(body.tags)))
@@ -8743,6 +9193,11 @@ async def update_watch(wid: int, body: WatchUpdate):
             raise HTTPException(404)
         if body.interval_seconds is not None and not 1 <= body.interval_seconds <= 86400:
             raise HTTPException(400, "监控间隔须为 1~86400 秒")
+        if body.interval_seconds is not None \
+                and _monitor_interval_below_plan(body.interval_seconds):
+            raise _plan_interval_error()
+        if body.enabled and not w.enabled:
+            _require_monitor_slot(s, adding=True)
         if body.enabled is not None:
             w.enabled = body.enabled
         if body.interval_seconds is not None:
@@ -8759,6 +9214,16 @@ async def update_watch(wid: int, body: WatchUpdate):
             if not 0 <= body.max_scrolls <= 50:
                 raise HTTPException(400, "抓取深度须为 0~50")
             w.max_scrolls = body.max_scrolls
+        if body.comment_max_age_minutes is not None:
+            if not 0 <= body.comment_max_age_minutes <= 10080:
+                raise HTTPException(400, "评论时间范围须为 0~10080 分钟；0 表示不限")
+            w.comment_max_age_minutes = body.comment_max_age_minutes
+        if body.comment_regions is not None:
+            w.comment_regions = _dump_meta_tags(_meta_tags(body.comment_regions))
+        if body.intent_keywords is not None:
+            w.intent_keywords = _dump_meta_tags(_meta_tags(body.intent_keywords))
+        if body.exclude_keywords is not None:
+            w.exclude_keywords = _dump_meta_tags(_meta_tags(body.exclude_keywords))
         if body.mode is not None and body.mode not in ("public", "creator"):
             raise HTTPException(400, "评论来源须为 public 或 creator")
         new_mode = body.mode if body.mode is not None else w.mode
@@ -8994,6 +9459,7 @@ class DanmakuWatchIn(BaseModel):
     kind: str = "auto"              # auto | video | user
     mode: str = "public"            # public | creator
     account_id: int | None = None
+    enabled: bool | None = None     # None=启用；False=先建好再暂停，不占监控位
     interval_seconds: int = 0       # 0=跟随全局扫描间隔
     recent_works: int = 0           # 0=跟随全局弹幕作品数
     recent_days: int = 0             # 0=跟随全局弹幕时间范围
@@ -9198,6 +9664,12 @@ async def add_danmaku_watch(body: DanmakuWatchIn):
                 raise HTTPException(400, "创作中心账号与监控账号不一致")
 
     with get_session() as s:
+        new_enabled = body.enabled is None or bool(body.enabled)
+        _require_monitor_slot(s, adding=new_enabled)
+        if _monitor_interval_below_plan(
+                body.interval_seconds, allow_follow_global=True):
+            raise _plan_interval_error(
+                follow_global=body.interval_seconds <= 0)
         q = select(DanmakuWatch).where(
             DanmakuWatch.platform == "douyin",
             DanmakuWatch.kind == kind,
@@ -9209,6 +9681,7 @@ async def add_danmaku_watch(body: DanmakuWatchIn):
         watch = DanmakuWatch(
             platform="douyin", kind=kind, aweme_id=aweme_id, sec_uid=sec_uid,
             title=title, mode=mode, account_id=body.account_id,
+            enabled=new_enabled,
             interval_seconds=body.interval_seconds,
             recent_works=body.recent_works, recent_days=body.recent_days,
             max_scrolls=body.max_scrolls,
@@ -9235,9 +9708,16 @@ async def update_danmaku_watch(wid: int, body: DanmakuWatchUpdate):
         watch = s.get(DanmakuWatch, wid)
         if not watch:
             raise HTTPException(404, "弹幕监控不存在")
+        if body.enabled and not watch.enabled:
+            _require_monitor_slot(s, adding=True)
         if body.interval_seconds is not None and body.interval_seconds != 0 \
                 and not 1 <= body.interval_seconds <= 86400:
             raise HTTPException(400, "监控间隔须为 1~86400 秒,或填 0 跟随全局")
+        if body.interval_seconds is not None \
+                and _monitor_interval_below_plan(
+                    body.interval_seconds, allow_follow_global=True):
+            raise _plan_interval_error(
+                follow_global=body.interval_seconds <= 0)
         if body.recent_works is not None and not 0 <= body.recent_works <= 50:
             raise HTTPException(400, "近期作品数须为 0~50")
         if body.recent_days is not None and not 0 <= body.recent_days <= 365:

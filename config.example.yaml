@@ -137,6 +137,16 @@ risk_control:
   network_group_risk_window_seconds: 900
   network_group_cooldown_seconds: 7200
 
+# 商业套餐限制（可选）。不配置具体上限时，本地部署保持不限。
+plan:
+  name: ""
+  active_monitor_slots: null   # 例如 5；null=不限
+  max_accounts: null           # 例如 3；null=不限
+  min_monitor_interval_seconds: null # 例如 3600；null=不限
+  monthly_lead_records: null   # 每月评论线索入库额度；null=不限
+  max_collection_tasks: null   # 定时关键词采集任务数上限；null=不限
+  max_keywords_per_task: null  # 单个采集任务的关键词数上限；null=按 20 个
+
 storage:
   db_path: ./data/creatorhub.db
 

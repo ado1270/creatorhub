@@ -178,10 +178,23 @@ class RiskControlConfig:
 
 
 @dataclass
+class PlanConfig:
+    """Optional commercial limits. Unset slots keep local deployments unlimited."""
+    name: str = ""
+    active_monitor_slots: int | None = None
+    max_accounts: int | None = None
+    min_monitor_interval_seconds: int | None = None
+    monthly_lead_records: int | None = None
+    max_collection_tasks: int | None = None
+    max_keywords_per_task: int | None = None
+
+
+@dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     risk_control: RiskControlConfig = field(default_factory=RiskControlConfig)
+    plan: PlanConfig = field(default_factory=PlanConfig)
     db_path: str = "./data/creatorhub.db"
     proxies: List[str] = field(default_factory=list)  # 代理池;建号时一号一代理 sticky 分配
 
@@ -264,6 +277,29 @@ def load_config(path: str | None = None) -> Config:
         risk_values["mode"] = (
             mode if mode in {"conservative", "custom"} else "conservative")
         cfg.risk_control = RiskControlConfig(**risk_values)
+        plan = raw.get("plan", {}) or {}
+        plan_values = {
+            k: v for k, v in plan.items()
+            if k in PlanConfig.__dataclass_fields__
+        }
+        cfg.plan = PlanConfig(**plan_values)
+        if cfg.plan.active_monitor_slots is not None:
+            cfg.plan.active_monitor_slots = max(
+                0, int(cfg.plan.active_monitor_slots))
+        if cfg.plan.max_accounts is not None:
+            cfg.plan.max_accounts = max(0, int(cfg.plan.max_accounts))
+        if cfg.plan.min_monitor_interval_seconds is not None:
+            cfg.plan.min_monitor_interval_seconds = max(
+                1, int(cfg.plan.min_monitor_interval_seconds))
+        if cfg.plan.monthly_lead_records is not None:
+            cfg.plan.monthly_lead_records = max(
+                0, int(cfg.plan.monthly_lead_records))
+        if cfg.plan.max_collection_tasks is not None:
+            cfg.plan.max_collection_tasks = max(
+                0, int(cfg.plan.max_collection_tasks))
+        if cfg.plan.max_keywords_per_task is not None:
+            cfg.plan.max_keywords_per_task = max(
+                1, int(cfg.plan.max_keywords_per_task))
         cfg.db_path = (raw.get("storage", {}) or {}).get("db_path", cfg.db_path)
         px = raw.get("proxies") or []
         cfg.proxies = [str(p).strip() for p in px if str(p).strip()]

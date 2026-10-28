@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import random
 import time
@@ -45,7 +46,11 @@ from ..platforms.xhs import (
     parse_note_detail,
 )
 from ..risk import classify_platform_error, RiskCategory
+from ..lead_push import push_comment_leads
+from ..quota import monthly_lead_usage
 from ..transport_matrix import douyin_client_environment
+
+log = logging.getLogger("creatorhub.engine")
 
 
 def _loads_keywords(raw: str) -> list[str]:
@@ -672,17 +677,25 @@ class KeywordCollector:
                 break
         return list(found.values())[:limit]
 
-    @staticmethod
-    def _persist_comments(job_id: int, content_id: int, platform: str,
-                          aweme_id: str, comments: list[dict]) -> int:
+    def _persist_comments(self, job_id: int, content_id: int, platform: str,
+                          aweme_id: str, comments: list[dict]) -> list[dict]:
+        """落库并返回本次新增的评论（受套餐线索额度约束）。"""
+        added_items: list[dict] = []
         with get_session() as session:
             known = set(session.exec(
                 select(KeywordCollectionComment.comment_id)
                 .where(KeywordCollectionComment.job_id == job_id)
                 .where(KeywordCollectionComment.content_id == content_id)
             ).all())
-            added = 0
+            lead_limit = getattr(self.cfg.plan, "monthly_lead_records", None)
+            remaining = None
+            if lead_limit is not None:
+                remaining = max(0, int(lead_limit) - monthly_lead_usage(session))
+                if remaining <= 0:
+                    return []
             for item in comments:
+                if remaining is not None and len(added_items) >= remaining:
+                    break
                 cid = str(item.get("comment_id") or "")
                 if not cid or cid in known:
                     continue
@@ -698,13 +711,28 @@ class KeywordCollector:
                     create_time=int(item.get("create_time") or 0),
                     reply_to=item.get("reply_to") or "",
                 ))
-                added += 1
+                added_items.append(item)
             content = session.get(KeywordCollectionContent, content_id)
             if content:
-                content.collected_comment_count = len(known)
+                content.collected_comment_count = len(known) + len(added_items)
                 session.add(content)
             session.commit()
-        return added
+        return added_items
+
+    async def _push_leads(self, platform: str, aweme_id: str,
+                           comments: list[dict], keyword: str) -> None:
+        """把新采集的评论推送到 gdb15 线索后台。"""
+        if not comments:
+            return
+        try:
+            result = await push_comment_leads(
+                comments, platform=platform, item_id=aweme_id,
+                intent_label=keyword, source_keyword=keyword)
+            if result.get("errors"):
+                log.warning("gdb15 线索推送失败 %s/%s: %s",
+                            platform, aweme_id, "; ".join(result["errors"]))
+        except Exception as exc:
+            log.warning("gdb15 线索推送异常 %s/%s: %r", platform, aweme_id, exc)
 
     async def run(self, job_id: int, account) -> dict:
         job = self._job(job_id)
@@ -941,8 +969,11 @@ class KeywordCollector:
                         comments, comment_error = await self._xhs_comments(
                             xhs_client, aweme.aweme_id, token, source,
                             job.max_comments_per_content, job.include_replies)
-                    self._persist_comments(
+                    added_comments = self._persist_comments(
                         job_id, content.id, job.platform, aweme.aweme_id, comments)
+                    if added_comments:
+                        await self._push_leads(
+                            job.platform, aweme.aweme_id, added_comments, keyword)
                     if comment_error:
                         self._record_error(
                             job_id, f"{keyword}/{aweme.aweme_id}: {comment_error}")

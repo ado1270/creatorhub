@@ -45,6 +45,9 @@ def row_deadline(row, cfg, *, kind: str) -> datetime | None:
     interval = row.interval_seconds
     if kind == "danmaku" and not interval:
         interval = cfg.engine.scan_interval_seconds
+    min_interval = getattr(cfg.plan, "min_monitor_interval_seconds", None)
+    if min_interval:
+        interval = max(interval, int(min_interval))
     return periodic_deadline(
         last_at, interval, key=f"{kind}:{row.id}", created_at=row.created_at,
         jitter=cfg.engine.scan_jitter,

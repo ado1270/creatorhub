@@ -296,6 +296,14 @@ class CommentWatch(SQLModel, table=True):
     recent_works: int = 0          # 账号型监控检查最近 N 个作品；0=全局默认
     recent_days: int = 0           # 账号型监控只检查最近 N 天；0=全局默认
     max_scrolls: int = 0           # 单个评论区抓取深度；0=全局默认
+    comment_max_age_minutes: int = 300  # 只保留 N 分钟内的评论；0=不限
+    comment_regions: str = "[]"    # JSON 字符串数组；空=不限地区
+    intent_keywords: str = ""      # 逗号分隔，命中则标记高意向
+    exclude_keywords: str = ""     # 逗号分隔，命中则跳过
+    # 推送水位线：JSON 字符串 {"作品ID": 已处理到的最大评论时间戳}。
+    # 单独存一份，不能只靠入库记录推导——套餐额度用尽时评论不会入库，
+    # 水位线也要往前推，否则同一批评论会被反复推送到 gdb15。
+    comment_watermark: str = "{}"
     enabled: bool = True
     last_scan_at: Optional[datetime] = None
     last_error: str = ""
@@ -353,6 +361,7 @@ class CommentRecord(SQLModel, table=True):
 class KeywordCollectionJob(SQLModel, table=True):
     """一次性的关键词批量采集任务。与持续轮询的 MonitorTarget 分开建模。"""
     id: Optional[int] = Field(default=None, primary_key=True)
+    schedule_id: int = Field(default=0, index=True)   # 来自哪个定时任务；0=手动
     platform: str = Field(default="douyin", index=True)  # douyin | xhs
     account_id: int = Field(index=True)
     source_type: str = Field(default="keyword", index=True)  # keyword | creator | favorite_all | favorite_board
@@ -391,6 +400,41 @@ class KeywordCollectionJob(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+
+
+class KeywordCollectionSchedule(SQLModel, table=True):
+    """定时关键词采集：按周期自动重跑同一套关键词配置。
+
+    与一次性任务分开建模：任务跑完就结束，定时任务长期存在，每次到点
+    新建一个 KeywordCollectionJob，历史结果按任务分开留存。
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(default="douyin", index=True)
+    account_id: int = Field(index=True)
+    name: str = ""
+    keywords: str = "[]"                 # JSON 字符串数组
+    interval_seconds: int = 3600         # 周期：1 分钟 ~ 30 天
+    max_contents_per_keyword: int = 20
+    max_pages_per_keyword: int = 12
+    stagnant_pages: int = 3
+    search_sort: str = "general"
+    publish_time: str = "all"
+    content_type: str = "all"
+    min_likes: int = 0
+    min_comments: int = 0
+    max_comments_per_content: int = 20
+    include_replies: bool = False
+    download_media: bool = False
+    video_quality: str = "highest"
+    download_dir: str = ""
+    enabled: bool = True
+    last_run_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = Field(default=None, index=True)
+    last_job_id: int = 0
+    last_status: str = ""
+    last_error: str = ""
+    consecutive_blocks: int = 0          # 连续被风控拦下的次数
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
 
 
 class KeywordCollectionContent(SQLModel, table=True):
@@ -433,6 +477,9 @@ class KeywordCollectionComment(SQLModel, table=True):
     like_count: int = 0
     create_time: int = 0
     reply_to: str = ""
+    # 是否算作可交付线索（命中采集线索过滤规则）。
+    # 历史入库的评论都已推送给 gdb15，默认按线索计费，避免老客户额度被追溯改变。
+    is_lead: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
 
 

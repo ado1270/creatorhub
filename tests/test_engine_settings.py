@@ -247,8 +247,18 @@ def test_comment_defaults_hot_apply_only_to_inheriting_watches(local_project):
     custom = store(CommentWatch(recent_works=3, recent_days=5, max_scrolls=4))
     engine = MonitorEngine(local_project.cfg, local_project.browser)
     assert request("PUT", {"comment_recent_works": 8, "comment_recent_days": 14, "comment_max_scrolls": 10}).status_code == 200
-    assert engine._comment_watch_settings(inherited) == {"recent_works": 8, "recent_days": 14, "max_scrolls": 10}
-    assert engine._comment_watch_settings(custom) == {"recent_works": 3, "recent_days": 5, "max_scrolls": 4}
+    assert engine._comment_watch_settings(inherited) == {
+        "recent_works": 8, "recent_days": 14, "max_scrolls": 10,
+        "alias": "",
+        "comment_max_age_minutes": 300, "comment_regions": [],
+        "intent_keywords": [], "exclude_keywords": [],
+    }
+    assert engine._comment_watch_settings(custom) == {
+        "recent_works": 3, "recent_days": 5, "max_scrolls": 4,
+        "alias": "",
+        "comment_max_age_minutes": 300, "comment_regions": [],
+        "intent_keywords": [], "exclude_keywords": [],
+    }
 
 
 @pytest.mark.parametrize("method", ["GET", "PUT"])

@@ -81,14 +81,23 @@ async function run() {
   assert.equal(f.run('collectionProgress({status:"running",total_keyword_count:2,processed_keyword_count:1,current_item_index:2,current_item_total:4,content_count:0})'), 75);
   assert.equal(f.run('collectionProgress({status:"done",total_keyword_count:2,processed_keyword_count:0,content_count:0})'), 100);
 
-  const expected = process.env.TZ === 'Asia/Shanghai' ? '2026-09-07T10:30:00.000Z' : '2026-09-07T22:30:00.000Z';
+  // The expectation follows the machine's own timezone. Read the zone the
+  // runtime actually resolved (process.env.TZ is often unset), otherwise a
+  // developer running this file by hand gets a bogus failure.
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const expectedByZone = {
+    'Asia/Shanghai': '2026-09-07T10:30:00.000Z',
+    'America/New_York': '2026-09-07T22:30:00.000Z',
+    'UTC': '2026-09-07T18:30:00.000Z',
+  };
+  const expected = expectedByZone[zone] || new Date('2026-09-07T18:30').toISOString();
   assert.equal(f.run('scheduleToApi("2026-09-07T18:30")'), expected);
   f.context.expected = expected;
   assert.equal(f.run('localDateTimeValue(expected)'), '2026-09-07T18:30');
   assert.equal(f.run('scheduleToApi("")'), null);
   assert.throws(() => f.run('scheduleToApi("not a date")'));
   assert.throws(() => f.run('scheduleToApi("2026-02-30T18:30")'));
-  if (process.env.TZ === 'America/New_York') assert.throws(() => f.run('scheduleToApi("2026-03-08T02:30")'));
+  if (zone === 'America/New_York') assert.throws(() => f.run('scheduleToApi("2026-03-08T02:30")'));
 
   // An old platform result must not replace the new platform's cards.
   const old = f.run('refreshContents()');
@@ -140,7 +149,7 @@ async function run() {
     'refreshMonitors', 'refreshContents', 'refreshWatches', 'refreshComments',
     'refreshDanmakuWatches', 'refreshDanmaku', 'refreshCommentRules', 'refreshCommentTasks',
     'refreshPublish', 'refreshCollections', 'refreshRiskCenter', 'refreshTaskQueue',
-    'refreshHubSummary', 'refreshTaskQueueBadge'];
+    'refreshHubSummary', 'refreshTaskQueueBadge', 'refreshQualityWorks'];
   refreshers.forEach(name => { f.context[name] = async () => { calls.push(name); }; });
   f.run('let POLL_RUNNING = false, POLL_TIMER = null, POLL_DELAY = 8000;');
   f.run(fn('loop'));

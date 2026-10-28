@@ -2226,6 +2226,47 @@
       <div class="collection-task-list" id="collection-job-table" role="list" aria-label="关键词采集任务列表" aria-live="polite"></div>
     </div>
 
+    <!-- 定时关键词采集 -->
+    <div class="card">
+      <div class="card-head">
+        <span class="card-ic"><svg><use href="#i-clock"/></svg></span>
+        <h2>定时关键词采集 <span class="sub">按周期自动重跑同一套关键词</span></h2>
+        <div class="right"><button class="ghost sm" type="button" onclick="refreshCollectionSchedules()"><svg><use href="#i-bolt"/></svg>刷新</button></div>
+      </div>
+      <div class="stack">
+        <div class="form-grid cols-4">
+          <div class="form-field"><label for="sched-name">任务名称（可选）</label><input id="sched-name" maxlength="60" placeholder="如：二手汽车每小时"></div>
+          <div class="form-field"><label for="sched-account">使用账号</label><select id="sched-account"></select></div>
+          <div class="form-field"><label for="sched-interval">采集周期</label><select id="sched-interval" onchange="onScheduleIntervalChange()">
+              <option value="1800">每 30 分钟</option>
+              <option value="3600" selected>每小时</option>
+              <option value="7200">每 2 小时</option>
+              <option value="21600">每 6 小时</option>
+              <option value="43200">每 12 小时</option>
+              <option value="86400">每天</option>
+              <option value="259200">每 3 天</option>
+              <option value="604800">每周</option>
+              <option value="custom">自定义…</option>
+          </select><p class="hint" id="sched-interval-help">周期越短请求越多，建议不低于 30 分钟。</p></div>
+          <div class="form-field" id="sched-interval-custom-wrap" style="display:none"><label for="sched-interval-custom">自定义周期（分钟）</label><input id="sched-interval-custom" type="number" min="1" max="43200" value="60" inputmode="numeric"></div>
+          <div class="form-field"><label for="sched-content-limit">每词作品上限</label><input id="sched-content-limit" type="number" min="1" max="100" value="20" inputmode="numeric"></div>
+          <div class="form-field"><label for="sched-comment-limit">每作品评论上限</label><input id="sched-comment-limit" type="number" min="0" max="200" value="20" inputmode="numeric"></div>
+          <div class="form-field"><label for="sched-sort">搜索排序</label><select id="sched-sort"><option value="general">综合排序</option><option value="latest">最新发布</option><option value="most_liked">最多点赞</option></select></div>
+          <div class="form-field"><label for="sched-publish-time">发布时间</label><select id="sched-publish-time"><option value="all">不限</option><option value="day">一天内</option><option value="week">一周内</option><option value="half_year">半年内</option></select></div>
+        </div>
+        <div class="form-field">
+          <label for="sched-keywords">关键词 <span class="field-scope">必填 · 最多 20 个</span></label>
+          <textarea id="sched-keywords" rows="3" placeholder="每行一个关键词，例如：&#10;二手汽车&#10;二手车转让" aria-describedby="sched-keywords-help"></textarea>
+          <p class="hint" id="sched-keywords-help">支持换行或逗号分隔；每次到点会新建一个采集任务，历史结果按任务分开留存。</p>
+        </div>
+        <div class="form-actions">
+          <span class="status-text" id="sched-msg" role="status" aria-live="polite"></span>
+          <button type="button" onclick="createCollectionSchedule()"><svg><use href="#i-clock"/></svg>创建定时任务</button>
+        </div>
+      </div>
+      <div class="collection-task-list" id="sched-table" role="list" aria-label="定时采集任务列表" aria-live="polite"></div>
+    </div>
+
     <div class="card" id="collection-results-card" style="display:none">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-film"/></svg></span>
@@ -2489,6 +2530,23 @@
   </section>
 
   <section data-panel="settings">
+  <div class="card" data-section="plan">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-settings"/></svg></span>
+      <h2>套餐用量 <span class="sub">监控位强制限制</span></h2>
+    </div>
+    <div class="stack">
+      <div class="form-grid cols-auto">
+        <div class="form-field"><label>套餐</label><input id="plan-name" value="不限" readonly></div>
+        <div class="form-field"><label>启用监控位</label><input id="plan-monitor-usage" value="不限" readonly></div>
+        <div class="form-field"><label>剩余监控位</label><input id="plan-monitor-remaining" value="不限" readonly></div>
+        <div class="form-field"><label>账号数</label><input id="plan-account-usage" value="不限" readonly></div>
+        <div class="form-field"><label>最低检查频率</label><input id="plan-min-interval" value="不限" readonly></div>
+        <div class="form-field"><label>本月评论线索</label><input id="plan-lead-usage" value="不限" readonly></div>
+      </div>
+      <p class="field-help">监控位按已启用状态计算：作品监控 + 评论监控 + 弹幕监控。账号数、最低检查频率和月度线索额度由部署配置强制限制。</p>
+    </div>
+  </div>
   <div class="card appearance-card" data-section="appearance">
     <div class="card-head">
       <span class="card-ic"><svg aria-hidden="true"><use href="#i-sun"/></svg></span>
@@ -2554,6 +2612,45 @@
     <div class="form-actions">
       <span class="status-text" id="dl-msg" role="status" aria-live="polite"></span>
       <button onclick="saveSettings()"><svg><use href="#i-check"/></svg>保存下载设置</button>
+    </div>
+  </div>
+
+  <!-- gdb15 线索推送 -->
+  <div class="card" data-section="lead-push">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-send"/></svg></span>
+      <h2>gdb15 线索推送 <span class="sub">评论监控自动同步</span></h2>
+    </div>
+    <div class="stack">
+      <label class="check">
+        <input type="checkbox" id="lead-push-enabled">
+        <span>启用 gdb15 自动推送</span>
+      </label>
+      <div class="form-grid cols-auto">
+        <div class="form-field">
+          <label for="lead-push-url">Webhook 地址</label>
+          <input id="lead-push-url" type="url" inputmode="url" autocomplete="url"
+            placeholder="https://www.gdb15.com/api/v1/leads/webhook">
+          <p class="field-help">仅支持 HTTPS；推送数据包含公开评论、来源链接和评论 ID。</p>
+        </div>
+        <div class="form-field">
+          <label for="lead-push-key">API Key</label>
+          <div class="input-affix">
+            <input id="lead-push-key" type="password" autocomplete="new-password"
+              placeholder="留空则不修改已保存的 Key">
+            <button class="input-action" type="button" onclick="toggleSecretInput('lead-push-key',this)"
+              aria-label="显示 gdb15 API Key" aria-pressed="false" title="显示或隐藏 API Key">
+              <svg><use href="#i-eye"/></svg>
+            </button>
+          </div>
+          <p class="field-help">Key 只保存在本机，不会回显。测试会创建一条测试线索。</p>
+        </div>
+      </div>
+      <div class="form-actions">
+        <span class="status-text" id="lead-push-msg" role="status" aria-live="polite"></span>
+        <button class="ghost" onclick="testLeadPushSettings()"><svg><use href="#i-bolt"/></svg>测试推送</button>
+        <button onclick="saveLeadPushSettings()"><svg><use href="#i-check"/></svg>保存推送设置</button>
+      </div>
     </div>
   </div>
 
@@ -3198,6 +3295,17 @@
               <option value="0">跟随全局设置</option><option value="3">浅层抓取</option>
               <option value="6">标准抓取</option><option value="12">深度抓取</option><option value="20">最大抓取</option>
           </select></div>
+          <div class="form-field"><label for="w-max-age">评论时间范围</label><select id="w-max-age" aria-describedby="w-max-age-help">
+              <option value="0">不限</option><option value="1">最近 1 分钟</option><option value="5">最近 5 分钟</option>
+              <option value="15">最近 15 分钟</option><option value="30">最近 30 分钟</option><option value="60">最近 1 小时</option>
+              <option value="120">最近 2 小时</option><option value="300" selected>最近 5 小时</option>
+              <option value="720">最近 12 小时</option><option value="1440">最近 24 小时</option>
+          </select><p id="w-max-age-help" class="field-help">超过时间的评论只留在平台侧，不进入本机线索池。</p></div>
+        </div>
+        <div class="form-grid cols-auto">
+          <div class="form-field"><label for="w-regions">地区筛选(可选)</label><input id="w-regions" placeholder="如：广东,东莞,深圳" aria-describedby="w-region-help"><p id="w-region-help" class="field-help">按评论 IP 属地筛选；留空表示不限地区。</p></div>
+          <div class="form-field"><label for="w-intent">高意向词(可选)</label><input id="w-intent" placeholder="如：多少钱,报价,怎么买" aria-describedby="w-intent-help"><p id="w-intent-help" class="field-help">留空不过滤；填多个词时命中任一项才保留。</p></div>
+          <div class="form-field"><label for="w-exclude">排除词(可选)</label><input id="w-exclude" placeholder="如：广告,同行,代运营"></div>
         </div>
         <div class="form-actions">
           <span class="status-text" id="w-msg" role="status" aria-live="polite"></span>
@@ -3220,8 +3328,29 @@
       <div class="toolbar-actions"><span class="toolbar-actions-label">操作</span><div class="export-actions" role="group" aria-label="评论监控 Excel 导出"><span class="export-caption" title="导出当前模块数据"><svg aria-hidden="true"><use href="#i-download"/></svg>Excel</span><button type="button" class="export-btn filtered" onclick="exportModuleReport('comment-watches', false, this)" title="导出当前条件下的全部匹配记录" aria-label="导出评论监控当前结果"><svg aria-hidden="true"><use href="#i-download"/></svg>当前结果</button><button type="button" class="export-btn full" onclick="exportModuleReport('comment-watches', true, this)" title="导出当前平台全部记录" aria-label="导出评论监控全部数据"><svg aria-hidden="true"><use href="#i-download"/></svg>全部数据</button></div></div>
       </div>
       <div class="table-wrap"><table aria-label="评论监控列表"><thead><tr>
-        <th>对象</th><th>分组 / 标签</th><th>类型</th><th>来源</th><th>评论数</th><th>间隔</th><th>上次扫描</th><th>状态</th><th>操作</th>
+      <th>对象</th><th>分组 / 标签</th><th>类型</th><th>来源</th><th>评论数</th><th>间隔</th><th>上次扫描</th><th>状态</th><th>操作</th>
       </tr></thead><tbody id="watch-table"></tbody></table></div>
+    </div>
+
+    <!-- 优质作品候选 -->
+    <div class="card" data-section="quality">
+      <div class="card-head">
+        <span class="card-ic"><svg><use href="#i-sparkles"/></svg></span>
+        <h2>优质作品候选 <span class="sub">按获客价值排序</span></h2>
+      </div>
+      <div class="manage-toolbar">
+        <select id="quality-source" aria-label="按来源筛选优质作品" onchange="refreshQualityWorks()">
+          <option value="">全部来源</option>
+          <option value="collection">关键词采集</option>
+          <option value="monitor">作品监控</option>
+        </select>
+        <span class="filter-count" id="quality-filter-count" role="status" aria-live="polite"></span>
+        <div class="toolbar-actions"><button class="ghost sm" onclick="refreshQualityWorks()"><svg><use href="#i-refresh"/></svg>刷新候选</button></div>
+      </div>
+      <p class="field-help">评分来自已抓到的真实评论：命中意向词 40 分、评论新鲜度 25 分、地区匹配 15 分、作品热度 10 分、非广告 10 分。70 分以上值得立即盯上。</p>
+      <div class="table-wrap"><table aria-label="优质作品候选"><thead><tr>
+        <th>作品</th><th>得分</th><th>命中意向</th><th>评论活跃</th><th>来源</th><th>操作</th>
+      </tr></thead><tbody id="quality-table"></tbody></table></div>
     </div>
 
   <!-- 评论数据 -->

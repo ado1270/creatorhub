@@ -117,6 +117,8 @@ def test_create_request_matches_current_web_envelope_and_participant_order():
 def test_dynamic_envelope_matches_first_party_browser_capture_byte_for_byte():
     captured = (Path(__file__).parents[1]
                 / "data/verification/douyin-api-compat/dm-init-request.pb")
+    if not captured.exists():
+        pytest.skip(f"缺少本地抓包样本: {captured}")
     raw = build_init_request(
         1766414628284028,
         sequence_id=10002,
@@ -132,6 +134,8 @@ def test_dynamic_envelope_matches_first_party_browser_capture_byte_for_byte():
 def test_create_request_matches_first_party_browser_capture_byte_for_byte():
     captured = (Path(__file__).parents[1] / "data/verification"
                 / "douyin-api-compat/dm-create-66790575681-firstparty.pb")
+    if not captured.exists():
+        pytest.skip(f"缺少本地抓包样本: {captured}")
     raw = build_create_conversation_request(
         "3928976331901290", "510601289795662",
         sequence_id=10010,

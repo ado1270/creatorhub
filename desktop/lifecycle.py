@@ -23,8 +23,23 @@ def watch_parent(parent_pid, stop_file):
         def alive():
             return bool(handle) and kernel.WaitForSingleObject(handle, 0) == 258
     else:
+        # POSIX has no process handle, so watch the pid itself. Comparing
+        # os.getppid() with parent_pid only works when the watched process is
+        # our literal parent; when the launcher hands the session to an
+        # intermediate process the comparison fails immediately and the
+        # service kills itself. Two signals cover both cases: the watched pid
+        # must still exist, and we must not have been reparented to init.
+        own_ppid = os.getppid()
         def alive():
-            return os.getppid() == parent_pid
+            if os.getppid() != own_ppid:
+                return False
+            try:
+                os.kill(parent_pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
 
     def monitor():
         try:

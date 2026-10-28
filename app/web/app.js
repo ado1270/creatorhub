@@ -1130,7 +1130,7 @@ function switchPlatform(pf) {
   applyPlatformUI();
   ["t-interval", "w-interval", "d-w-interval"].forEach(id => $(id)?._monitorIntervalSync?.());
   // 切换后立刻刷新该平台数据
-  refreshAccounts(); refreshMonitors(); refreshContents(); refreshWatches(); refreshComments(); refreshDanmakuWatches(); refreshDanmaku(); refreshCollections();
+  refreshAccounts(); refreshMonitors(); refreshContents(); refreshWatches(); refreshComments(); refreshDanmakuWatches(); refreshDanmaku(); refreshCollections(); refreshQualityWorks();
   updateTaskQueuePlatformLabel();
   if (CURRENT_TAB === "queue") refreshTaskQueue(true); else refreshTaskQueueBadge();
   if (CURRENT_TAB === "risk-control") refreshRiskCenter(true, false);
@@ -3628,6 +3628,7 @@ function populateCollectionAccount() {
   if (list.some(a => String(a.id) === current)) sel.value = current;
   else if (list.length) sel.value = String(list[0].id);
   if (sel._csSync) sel._csSync();
+  populateScheduleAccount();
 }
 function populateWatchAccount() {
   const sel = $("w-acc"); if (!sel) return;
@@ -4406,6 +4407,36 @@ async function loadSettings() {
   globalThis.CreatorHubEngineSettings?.load();
   refreshTransportMatrix();
   try {
+    const plan = await api("/api/plan/usage");
+    if ($("plan-name")) $("plan-name").value = plan.plan_name || "不限";
+    if ($("plan-monitor-usage")) {
+      $("plan-monitor-usage").value = plan.active_monitor_slots == null
+        ? `${plan.monitor_usage.total} / 不限`
+        : `${plan.monitor_usage.total} / ${plan.active_monitor_slots}`;
+    }
+    if ($("plan-monitor-remaining")) {
+      $("plan-monitor-remaining").value = plan.monitor_remaining == null
+        ? "不限" : String(plan.monitor_remaining);
+    }
+    if ($("plan-account-usage")) {
+      $("plan-account-usage").value = plan.max_accounts == null
+        ? `${plan.account_usage} / 不限`
+        : `${plan.account_usage} / ${plan.max_accounts}`;
+    }
+    if ($("plan-min-interval")) {
+      const seconds = plan.min_monitor_interval_seconds;
+      $("plan-min-interval").value = seconds == null ? "不限"
+        : seconds % 3600 === 0 ? `${seconds / 3600} 小时`
+        : seconds % 60 === 0 ? `${seconds / 60} 分钟`
+        : `${seconds} 秒`;
+    }
+    if ($("plan-lead-usage")) {
+      $("plan-lead-usage").value = plan.monthly_lead_records == null
+        ? `${plan.lead_usage} / 不限`
+        : `${plan.lead_usage} / ${plan.monthly_lead_records}`;
+    }
+  } catch (e) {}
+  try {
     const s = await api("/api/settings");
     const assign = (id, property, value) => {
       if (!globalThis.CreatorHubWorkbench?.isDirty?.(id)) $(id)[property] = value;
@@ -4420,8 +4451,59 @@ async function loadSettings() {
       assign("ai-prompt", "value", s.ai_prompt || "");
       $("ai-key").placeholder = s.ai_api_key_set ? "已保存(留空=不修改)" : "API Key";
     }
+    if ($("lead-push-enabled")) {
+      assign("lead-push-enabled", "checked", !!s.lead_push_enabled);
+      assign("lead-push-url", "value", s.lead_push_url || "");
+      $("lead-push-key").placeholder = s.lead_push_api_key_set
+        ? "已保存(留空=不修改)" : "API Key";
+    }
     csSyncAll();
   } catch (e) {}
+}
+async function saveLeadPushSettings() {
+  const url = $("lead-push-url").value.trim();
+  if (!url) { $("lead-push-msg").textContent = "请填写 Webhook 地址"; return; }
+  $("lead-push-msg").textContent = "保存中…";
+  await withBusy(evtBtn(), "保存中", async () => {
+    try {
+      const body = {
+        lead_push_enabled: $("lead-push-enabled").checked,
+        lead_push_url: url,
+      };
+      const key = $("lead-push-key").value.trim();
+      if (key) body.lead_push_api_key = key;
+      const s = await api("/api/settings", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      $("lead-push-key").value = "";
+      $("lead-push-key").placeholder = s.lead_push_api_key_set
+        ? "已保存(留空=不修改)" : "API Key";
+      $("lead-push-msg").textContent = "已保存 ✓";
+      toast("gdb15 推送设置已保存", "ok");
+    } catch (e) {
+      $("lead-push-msg").textContent = "失败: " + e.message;
+      toast("保存失败:" + e.message, "err");
+    }
+  });
+}
+async function testLeadPushSettings() {
+  $("lead-push-msg").textContent = "测试中…";
+  await withBusy(evtBtn(), "测试中", async () => {
+    try {
+      const result = await api("/api/settings/lead-push-test", { method: "POST" });
+      if (result.ok) {
+        $("lead-push-msg").textContent = `推送成功，新增 ${result.pushed || 0} 条`;
+        toast("gdb15 推送连通正常 ✓", "ok");
+      } else {
+        $("lead-push-msg").textContent = result.errors?.[0] || "推送失败";
+        toast("gdb15 推送测试失败", "err");
+      }
+    } catch (e) {
+      $("lead-push-msg").textContent = "测试失败: " + e.message;
+      toast("测试失败:" + e.message, "err");
+    }
+  });
 }
 async function saveAiSettings() {
   if (!validateAiSettings(false)) return;
@@ -5372,6 +5454,170 @@ function renderCollectionJobs() {
     </article>`;
   }).join("") || collectionTaskEmpty();
 }
+let COLLECTION_SCHEDULES = [];
+function scheduleIntervalSeconds() {
+  const value = $("sched-interval") ? $("sched-interval").value : "3600";
+  if (value === "custom") {
+    return Math.max(60, Number($("sched-interval-custom")?.value || 60) * 60);
+  }
+  return Number(value || 3600);
+}
+function onScheduleIntervalChange() {
+  const custom = $("sched-interval") && $("sched-interval").value === "custom";
+  if ($("sched-interval-custom-wrap")) {
+    $("sched-interval-custom-wrap").style.display = custom ? "" : "none";
+  }
+}
+function populateScheduleAccount() {
+  const sel = $("sched-account"); if (!sel) return;
+  const current = sel.value;
+  const platformName = PF_NAME[PLATFORM] || "平台";
+  const list = ACCOUNTS.filter(a => a.platform === PLATFORM && a.status !== "invalid" && a.has_storage);
+  sel.innerHTML = accOptions(list, list.length ? `请选择${platformName}账号` : `暂无可用${platformName}账号`);
+  if (list.some(a => String(a.id) === current)) sel.value = current;
+  else if (list.length) sel.value = String(list[0].id);
+  if (sel._csSync) sel._csSync();
+}
+function scheduleStatusPill(schedule) {
+  if (!schedule.enabled) return { cls: "skipped", label: "已暂停" };
+  const map = {
+    queued: { cls: "pending", label: "排队中" },
+    running: { cls: "downloading", label: "执行中" },
+    done: { cls: "done", label: "已完成" },
+    partial: { cls: "pending", label: "部分完成" },
+    failed: { cls: "failed", label: "失败" },
+    blocked: { cls: "invalid", label: "被风控拦截" },
+  };
+  return map[schedule.last_status] || { cls: "active", label: "等待下次" };
+}
+function renderCollectionSchedules() {
+  const body = $("sched-table"); if (!body) return;
+  body.innerHTML = COLLECTION_SCHEDULES.map(schedule => {
+    const status = scheduleStatusPill(schedule);
+    const keywords = (schedule.keywords || []).map(k => `<span class="meta-chip">${esc(k)}</span>`).join("");
+    const nextAt = schedule.next_run_at ? new Date(schedule.next_run_at + "Z").toLocaleString() : "—";
+    const lastAt = schedule.last_run_at ? new Date(schedule.last_run_at + "Z").toLocaleString() : "尚未执行";
+    const error = schedule.last_error
+      ? `<div class="collection-step" style="color:var(--warn)">${esc(schedule.last_error)}</div>` : "";
+    const blocks = Number(schedule.consecutive_blocks || 0)
+      ? `<span class="pill invalid">连续拦截 ${Number(schedule.consecutive_blocks)} 次</span>` : "";
+    return `<article class="collection-task" role="listitem" aria-label="定时任务 ${schedule.id}">
+      <div class="collection-task-meta"><div><span class="collection-task-label">任务状态</span><span class="pill ${status.cls}">${status.label}</span> ${blocks}</div><time class="collection-task-created" datetime="${esc(schedule.created_at || "")}">${lastAt}</time></div>
+      <div class="collection-task-keywords"><span class="collection-task-label">${esc(schedule.name || "关键词")}</span><div class="keyword-stack">${keywords || '<span class="mut">未设置关键词</span>'}</div></div>
+      <div class="collection-task-config"><span class="collection-task-label">采集配置</span><div class="collection-task-config-main">每 ${monitorIntervalText(schedule.interval_seconds)} 一次 · ${schedule.max_contents_per_keyword} 作品/词 · ${schedule.max_comments_per_content} 评论/作品</div><div class="collection-task-config-sub">下次运行 ${esc(nextAt)}${error ? `<br>${error}` : ""}</div></div>
+      <div class="collection-task-actions" aria-label="定时任务 ${schedule.id} 操作">
+        <button type="button" class="sm collection-task-primary" onclick="runCollectionScheduleNow(${schedule.id})">${ic("i-play")}立即执行</button>
+        <button type="button" class="ghost sm" onclick="toggleCollectionSchedule(${schedule.id}, ${!schedule.enabled})">${schedule.enabled ? "暂停" : "启用"}</button>
+        <button type="button" class="ghost sm danger collection-task-delete" onclick="deleteCollectionSchedule(${schedule.id})" aria-label="删除定时任务 ${schedule.id}">${ic("i-trash")}删除</button>
+      </div>
+    </article>`;
+  }).join("") || `<div class="empty"><div class="empty-ic">${ic("i-clock")}</div><div class="empty-t">还没有定时采集任务</div><div class="empty-sub">填好关键词和周期，创建后系统会按周期自动采集。</div></div>`;
+}
+async function refreshCollectionSchedules() {
+  if (!$("sched-table") || !["douyin", "xhs"].includes(PLATFORM)) return;
+  try {
+    const rows = await api("/api/collection-schedules?platform=" + encodeURIComponent(PLATFORM));
+    COLLECTION_SCHEDULES = rows || [];
+    renderCollectionSchedules();
+  } catch (e) {
+    if (CURRENT_TAB === "collections") toast("定时任务刷新失败：" + e.message, "err");
+  }
+}
+async function createCollectionSchedule() {
+  const keywords = String($("sched-keywords")?.value || "").split(/[,，、;；\n]+/).map(x => x.trim()).filter(Boolean);
+  const accountId = Number($("sched-account")?.value || 0);
+  const contentLimit = Number($("sched-content-limit")?.value || 0);
+  const commentLimit = Number($("sched-comment-limit")?.value || 0);
+  let valid = true;
+  valid = setFieldError($("sched-keywords"), keywords.length ? (keywords.length > 20 ? "单个任务最多 20 个关键词" : "") : "请至少填写一个关键词") && valid;
+  valid = setFieldError($("sched-account"), !accountId ? "请选择一个已登录账号" : "") && valid;
+  valid = setFieldError($("sched-content-limit"), contentLimit < 1 || contentLimit > 100 ? "请输入 1–100" : "") && valid;
+  valid = setFieldError($("sched-comment-limit"), commentLimit < 0 || commentLimit > 200 ? "请输入 0–200" : "") && valid;
+  if (!valid) {
+    const first = document.querySelector('[aria-invalid="true"]');
+    if (first) first.focus();
+    return;
+  }
+  $("sched-msg").textContent = "创建中…";
+  const btn = evtBtn();
+  await withBusy(btn, "创建中", async () => {
+    try {
+      await api("/api/collection-schedules", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          platform: PLATFORM, account_id: accountId, keywords,
+          source_type: "keyword", name: $("sched-name")?.value.trim() || "",
+          interval_seconds: scheduleIntervalSeconds(),
+          max_contents_per_keyword: contentLimit,
+          max_comments_per_content: commentLimit,
+          search_sort: $("sched-sort")?.value || "general",
+          publish_time: $("sched-publish-time")?.value || "all",
+          content_type: "all", max_pages_per_keyword: 12, stagnant_pages: 3,
+          min_likes: 0, min_comments: 0, include_replies: false,
+          download_media: false, video_quality: "highest",
+        }),
+      });
+      $("sched-keywords").value = "";
+      $("sched-name").value = "";
+      $("sched-msg").textContent = "已创建 ✓";
+      toast("定时采集任务已创建", "ok");
+      await refreshCollectionSchedules();
+    } catch (e) {
+      $("sched-msg").textContent = "失败: " + e.message;
+      toast("创建失败:" + e.message, "err");
+    }
+  });
+}
+async function toggleCollectionSchedule(id, enabled) {
+  const schedule = COLLECTION_SCHEDULES.find(s => s.id === Number(id));
+  if (!schedule) return;
+  try {
+    await api("/api/collection-schedules/" + id, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        platform: schedule.platform, account_id: schedule.account_id,
+        keywords: schedule.keywords || [], source_type: "keyword",
+        name: schedule.name || "", interval_seconds: schedule.interval_seconds,
+        max_contents_per_keyword: schedule.max_contents_per_keyword,
+        max_comments_per_content: schedule.max_comments_per_content,
+        search_sort: schedule.search_sort || "general",
+        publish_time: schedule.publish_time || "all",
+        content_type: schedule.content_type || "all",
+        max_pages_per_keyword: 12, stagnant_pages: 3,
+        min_likes: Number(schedule.min_likes || 0),
+        min_comments: Number(schedule.min_comments || 0),
+        include_replies: !!schedule.include_replies,
+        download_media: !!schedule.download_media,
+        enabled: !!enabled,
+      }),
+    });
+    toast(enabled ? "定时任务已启用" : "定时任务已暂停", "ok");
+    await refreshCollectionSchedules();
+  } catch (e) {
+    toast("操作失败:" + e.message, "err");
+  }
+}
+async function runCollectionScheduleNow(id) {
+  try {
+    await api("/api/collection-schedules/" + id + "/run-now", { method: "POST" });
+    toast("已排入执行队列", "ok");
+    await refreshCollectionSchedules();
+    refreshCollections();
+  } catch (e) {
+    toast("执行失败:" + e.message, "err");
+  }
+}
+async function deleteCollectionSchedule(id) {
+  if (!confirm("确定删除这个定时采集任务？已采集的历史结果会保留。")) return;
+  try {
+    await api("/api/collection-schedules/" + id, { method: "DELETE" });
+    toast("定时任务已删除", "ok");
+    await refreshCollectionSchedules();
+  } catch (e) {
+    toast("删除失败:" + e.message, "err");
+  }
+}
+
 async function refreshCollections() {
   const isCurrent = beginViewRequest("collections");
   if (!$("collection-job-table") || !["douyin", "xhs"].includes(PLATFORM)) return;
@@ -5382,6 +5628,7 @@ async function refreshCollections() {
     const active = COLLECTION_JOBS.filter(j => ["pending", "running"].includes(j.status)).length;
     if ($("tb-col")) $("tb-col").textContent = active || COLLECTION_JOBS.length;
     renderCollectionJobs();
+    refreshCollectionSchedules();
     if (COLLECTION_JOB_ID) {
       const job = COLLECTION_JOBS.find(j => j.id === COLLECTION_JOB_ID);
       if (job) {
@@ -6834,11 +7081,15 @@ async function addWatch() {
           recent_works: +$("w-recent").value,
           recent_days: +$("w-days").value,
           max_scrolls: +$("w-depth").value,
+          comment_max_age_minutes: Math.max(0, +$("w-max-age").value || 0),
+          comment_regions: parseDanmakuKeywords($("w-regions").value),
+          intent_keywords: parseDanmakuKeywords($("w-intent").value),
+          exclude_keywords: parseDanmakuKeywords($("w-exclude").value),
           alias: $("w-alias").value.trim(), group_name: getMetaValue("w-group").trim(),
           tags: parseTags(getMetaValue("w-tags")),
         }),
       });
-      ["w-url", "w-alias"].forEach(id => $(id).value = "");
+      ["w-url", "w-alias", "w-regions", "w-intent", "w-exclude"].forEach(id => $(id).value = "");
       setMetaValue("w-group", ""); setMetaValue("w-tags", "");
       resetWatchTargetState();
       $("w-msg").textContent = "已添加 ✓"; toast("已开始监控评论", "ok");
@@ -6889,6 +7140,61 @@ async function refreshWatches() {
   if ($("tb-watch")) $("tb-watch").textContent = ws.length;
   renderWatchRows();
 }
+let QUALITY_WORKS = [];
+async function refreshQualityWorks() {
+  const isCurrent = beginViewRequest("quality");
+  const rows = await api("/api/quality-works?limit=50&platform=" + PLATFORM);
+  if (!isCurrent()) return;
+  QUALITY_WORKS = rows || [];
+  renderQualityRows();
+}
+function renderQualityRows() {
+  const source = $("quality-source") ? $("quality-source").value : "";
+  const rows = QUALITY_WORKS.filter(w => !source || w.source === source);
+  if ($("quality-filter-count")) {
+    $("quality-filter-count").textContent = `显示 ${rows.length} / ${QUALITY_WORKS.length}`;
+  }
+  $("quality-table").innerHTML = rows.map((w, index) => {
+    const score = Math.round(Number(w.score) || 0);
+    const level = score >= 70 ? "done" : (score >= 40 ? "pending" : "skipped");
+    const terms = (w.matched_terms || []).join("、");
+    const lastAt = w.last_comment_at
+      ? new Date(Number(w.last_comment_at) * 1000).toLocaleString() : "—";
+    const origin = w.source === "collection"
+      ? `关键词采集${w.keyword ? "：" + w.keyword : ""}` : "作品监控";
+    return `<tr>
+      <td><div class="user-cell"><div><span>${esc(String(w.desc || w.aweme_id || "").slice(0, 60))}</span>
+        <div class="alias-line">${esc(w.aweme_id || "")}</div></div></div></td>
+      <td class="num"><span class="pill ${level}">${score}</span></td>
+      <td>${terms ? esc(terms) : '<span class="mut">—</span>'}</td>
+      <td class="num">${Number(w.demand_count) || 0} 条高意向 · ${Number(w.fresh_comments) || 0} 条新评论
+        <div class="mut" style="font-size:11px">最近 ${esc(lastAt)}</div></td>
+      <td>${esc(origin)}</td>
+      <td class="acttd">${w.watched
+        ? '<span class="pill skipped">监控中</span>'
+        : `<button class="ghost sm" onclick="addQualityWatch(${index})">加入评论监控</button>`}</td>
+    </tr>`;
+  }).join("") || empty(6, "暂无优质作品候选", "i-sparkles",
+    "先用关键词采集找到有真实需求的作品，系统会按获客价值排序。", "collections");
+}
+async function addQualityWatch(index) {
+  const work = QUALITY_WORKS[index];
+  if (!work) return;
+  try {
+    await api("/api/quality-works/watch", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        platform: work.platform, aweme_id: work.aweme_id,
+        intent_keywords: work.matched_terms || [],
+      }),
+    });
+    toast("已加入评论监控", "ok");
+    await refreshQualityWorks();
+    refreshWatches();
+  } catch (e) {
+    toast("加入失败:" + e.message, "err");
+  }
+}
 async function editWatchMeta(id) {
   const item = watchById(id); if (!item) return;
   const accounts = ACCOUNTS.filter(a => a.platform === item.platform && a.status !== "invalid");
@@ -6910,6 +7216,11 @@ async function editWatchMeta(id) {
     [0, "跟随全局设置"], [3, "浅层抓取"], [6, "标准抓取"],
     [12, "深度抓取"], [20, "最大抓取"],
   ]);
+  const ageOptions = numericSelectOptions(item.comment_max_age_minutes ?? 300, [
+    [0, "不限"], [1, "最近 1 分钟"], [5, "最近 5 分钟"], [15, "最近 15 分钟"],
+    [30, "最近 30 分钟"], [60, "最近 1 小时"], [120, "最近 2 小时"],
+    [300, "最近 5 小时"], [720, "最近 12 小时"], [1440, "最近 24 小时"],
+  ]);
   const value = await new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
     _uiGetVal = () => ({
@@ -6922,6 +7233,10 @@ async function editWatchMeta(id) {
       recent_works: $("ew-recent") ? +$("ew-recent").value : item.recent_works || 0,
       recent_days: $("ew-days") ? +$("ew-days").value : item.recent_days || 0,
       max_scrolls: $("ew-depth") ? +$("ew-depth").value : item.max_scrolls || 0,
+      comment_max_age_minutes: $("ew-max-age") ? +$("ew-max-age").value : item.comment_max_age_minutes ?? 300,
+      comment_regions: parseDanmakuKeywords($("ew-regions").value),
+      intent_keywords: parseDanmakuKeywords($("ew-intent").value),
+      exclude_keywords: parseDanmakuKeywords($("ew-exclude").value),
     });
     $("ui-body").innerHTML = `
       <fieldset class="monitor-config-group">
@@ -6948,6 +7263,18 @@ async function editWatchMeta(id) {
         </div>` : ""}
         ${item.platform === "xhs" ? "" : `<div><label class="field" for="ew-depth">评论区抓取深度</label>
           <select id="ew-depth">${depthOptions}</select></div>`}
+        <div class="row">
+          <div><label class="field" for="ew-max-age">评论时间范围</label>
+            <select id="ew-max-age">${ageOptions}</select></div>
+          <div><label class="field" for="ew-regions">地区筛选</label>
+            <input id="ew-regions" value="${esc((item.comment_regions || []).join(","))}" placeholder="如：广东,东莞,深圳"></div>
+        </div>
+        <div class="row">
+          <div><label class="field" for="ew-intent">高意向词</label>
+            <input id="ew-intent" value="${esc((item.intent_keywords || []).join(","))}" placeholder="如：多少钱,报价,怎么买"></div>
+          <div><label class="field" for="ew-exclude">排除词</label>
+            <input id="ew-exclude" value="${esc((item.exclude_keywords || []).join(","))}" placeholder="如：广告,同行,代运营"></div>
+        </div>
       </fieldset>`;
     enhanceMetaControl($("ew-group"), "group"); enhanceMetaControl($("ew-tags"), "tags");
     setMetaValue("ew-group", item.group_name || ""); setMetaValue("ew-tags", itemTags(item).join(","));
@@ -6959,6 +7286,7 @@ async function editWatchMeta(id) {
     if ($("ew-depth")) $("ew-depth").value = String(item.max_scrolls || 0);
     ["ew-interval", "ew-account", "ew-mode", "ew-recent", "ew-days", "ew-depth"]
       .forEach(key => { const el = $(key); if (el) enhanceSelect(el); });
+    $("ew-max-age").value = String(item.comment_max_age_minutes ?? 300);
     _uiOpen("编辑评论监控", "监控对象保持不变。更换作品或创作者，请新建评论监控。", {
       okText: "保存修改", wide: true, icon: "i-msg",
       submit: value => api("/api/comment-watches/" + id, {
@@ -8251,7 +8579,7 @@ async function loop() {
     overview: [refreshOverviewSummary, refreshOverviewChart],
     accounts: [refreshAccounts],
     monitors: [refreshMonitors, refreshContents],
-    comments: [refreshWatches, refreshComments],
+    comments: [refreshWatches, refreshComments, refreshQualityWorks],
     danmaku: [refreshDanmakuWatches, refreshDanmaku],
     autocomment: [refreshCommentRules, refreshCommentTasks],
     publish: [refreshPublish],
