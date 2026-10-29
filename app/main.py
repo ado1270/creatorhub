@@ -5296,6 +5296,9 @@ def _pool_dict(p: ProxyPool, used: int = 0) -> dict:
         "city": p.city, "isp": p.isp,
         "geo_loc": _geo_loc(p), "is_mainland": _is_mainland(p.country, p.region, p.city),
         "geo_checked": bool(p.exit_ip),
+        # cloud=云端授权下发的：地址和状态以 gdb15 后台为准，本地改了下次同步会被覆盖。
+        "origin": p.origin or "local",
+        "remote_id": p.remote_id or "",
         "last_checked_at": p.last_checked_at.isoformat() if p.last_checked_at else None,
     }
 
@@ -5382,6 +5385,10 @@ async def update_proxy(pid: int, body: PoolProxyUpdate):
         if not p:
             raise HTTPException(404, "代理不存在")
         if body.url is not None:
+            # 云端授权的代理以 gdb15 后台为准。本地改了也会在下次同步时被覆盖，
+            # 与其让人以为改生效了，不如直接说清楚。
+            if (p.origin or "local") == "cloud":
+                raise HTTPException(400, "这是云端授权的代理，地址请到 gdb15 后台改")
             url = body.url.strip()
             if not url or not _parse_proxy(url):
                 raise HTTPException(400, "代理格式无法解析")
@@ -5402,6 +5409,9 @@ async def del_proxy(pid: int):
         p = s.get(ProxyPool, pid)
         if not p:
             return {"ok": True}
+        if (p.origin or "local") == "cloud":
+            # 云端撤销的代理本地会「停用」而不是删除，保留现场供客户核对。
+            raise HTTPException(400, "这是云端授权的代理，请在 gdb15 后台停用它")
         used = len(s.exec(select(DouyinAccount.id)
                           .where(DouyinAccount.proxy == p.url)).all())
         s.delete(p); s.commit()
@@ -8031,6 +8041,39 @@ async def license_refresh():
     """刷新授权并返回最新用量。"""
     await verify_license(cfg)
     return effective_status(cfg)
+
+
+@app.post("/api/resources/sync")
+async def resources_sync():
+    """手动把云端授权的代理池拉到本地，并回报本地实况。
+
+    心跳时也会自动同步一次；这里给客户一个「立刻生效」的按钮。
+    """
+    from .resources import sync_and_report
+    return await sync_and_report()
+
+
+@app.get("/api/resources/status")
+async def resources_status():
+    """本地云端授权资源的现状：授权了几条、用掉几条、账号绑了几条。"""
+    from .resources import collect_local_resources, resource_base_url, resource_api_key
+    from .db import get_session
+    from .models import ProxyPool
+    with get_session() as s:
+        rows = s.exec(select(ProxyPool).where(ProxyPool.origin == "cloud")).all()
+        cloud_total = len(rows)
+        cloud_enabled = len([r for r in rows if r.enabled])
+        assigned = len([r for r in rows if r.remote_id])
+    snapshot = collect_local_resources()
+    return {
+        "configured": bool(resource_base_url() and resource_api_key()),
+        "server": resource_base_url(),
+        "cloud_total": cloud_total,
+        "cloud_enabled": cloud_enabled,
+        "cloud_assigned": assigned,
+        "accounts_reported": len(snapshot.get("accounts") or []),
+        "proxies_reported": len(snapshot.get("proxies") or []),
+    }
 
 
 @app.post("/api/monitors")

@@ -155,6 +155,11 @@ class ProxyPool(SQLModel, table=True):
     region: str = ""
     city: str = ""
     isp: str = ""
+    # 来源：local=客户自己加的；cloud=云端(gdb15)授权下发的。
+    # 两者分开是因为处置方式不一样 —— 本地加的随便改，云端下发的以云端为准。
+    origin: str = "local"
+    # 云端代理 id。本地新增的留空；云端下发的靠它对上号。
+    remote_id: str = ""
     last_checked_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 

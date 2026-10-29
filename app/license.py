@@ -380,6 +380,31 @@ def _parse_iso(value: str) -> datetime | None:
     return parsed
 
 
+async def sync_cloud_resources() -> None:
+    """顺带把云端授权的代理池拉下来，并回报本地实况。
+
+    授权校验是主业，代理池是附加能力。所以这里失败只记日志，
+    绝不能因为代理池连不上就让整个采集停摆。
+    """
+    try:
+        from .resources import sync_and_report
+        result = await sync_and_report()
+    except Exception as exc:
+        print(f"[license] 同步云端资源失败：{exc!r}")
+        return
+    if not result.get("ok"):
+        reason = (result.get("sync") or {}).get("reason") or "未知原因"
+        print(f"[license] 同步云端资源未完成：{reason}")
+        return
+    proxies = (result.get("sync") or {}).get("proxies") or {}
+    assignments = (result.get("sync") or {}).get("assignments") or {}
+    print(
+        f"[license] 云端代理池已同步：新增 {proxies.get('added', 0)} 条，"
+        f"更新 {proxies.get('updated', 0)} 条，停用 {proxies.get('revoked', 0)} 条，"
+        f"指派生效 {assignments.get('applied', 0)} 个账号"
+    )
+
+
 async def license_loop(cfg) -> None:
     """后台心跳循环。启动时先校验一次，之后定时刷新。"""
     while True:
@@ -387,6 +412,7 @@ async def license_loop(cfg) -> None:
             result = await verify(cfg)
             if result.get("checked"):
                 print(f"[license] 已从 gdb15 获取套餐：{result.get('status')}")
+                await sync_cloud_resources()
             elif result.get("reason"):
                 print(f"[license] 校验未完成：{result['reason']}")
         except asyncio.CancelledError:

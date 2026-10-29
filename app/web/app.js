@@ -4152,7 +4152,7 @@ async function refreshProxies() {
   };
   tb.querySelector("tbody").innerHTML = rows.map(p => `<tr>
       <td>
-        <div><b>${esc(p.label || "(未命名)")}</b> <span class="pill ${stCls(p.status)}">${stTxt[p.status] || p.status}</span>${p.enabled ? "" : ' <span class="pill bare">已停用</span>'}</div>
+        <div><b>${esc(p.label || "(未命名)")}</b> <span class="pill ${stCls(p.status)}">${stTxt[p.status] || p.status}</span>${p.enabled ? "" : ' <span class="pill bare">已停用</span>'}${p.origin === "cloud" ? ' <span class="pill active" title="由 gdb15 后台授权下发，地址和启停以那边为准">云端授权</span>' : ""}</div>
         <div class="mut" style="font-size:11px;margin-top:2px"><code>${esc(p.url)}</code></div>
         ${p.note ? `<div class="mut" style="font-size:11px">${esc(p.note)}</div>` : ""}
       </td>
@@ -4162,7 +4162,7 @@ async function refreshProxies() {
         <button class="ghost sm" onclick="editPoolProxy(${p.id})">编辑</button>
         <button class="ghost sm" onclick="testPoolProxy(${p.id})">测试</button>
         <button class="ghost sm" onclick="togglePoolProxy(${p.id},${p.enabled})">${p.enabled ? "停用" : "启用"}</button>
-        <button class="ghost sm danger" onclick="delPoolProxy(${p.id},${p.used_by})">${ic("i-trash")}删除</button>
+        ${p.origin === "cloud" ? "" : `<button class="ghost sm danger" onclick="delPoolProxy(${p.id},${p.used_by})">${ic("i-trash")}删除</button>`}
       </td>
     </tr>`).join("") || empty(4, "代理池为空", "i-shield", "添加住宅/4G 代理,账号即可一号一代理关联使用");
 }
@@ -4202,6 +4202,21 @@ async function addProxy() {
     $("px-url").value = ""; $("px-label").value = "";
     toast("已加入代理池", "ok"); refreshProxies();
   } catch (e) { toast("添加失败:" + e.message, "err"); }
+}
+async function syncCloudResources() {
+  const btn = event.target.closest("button"); btn.disabled = true; const old = btn.textContent; btn.textContent = "同步中…";
+  try {
+    const r = await api("/api/resources/sync", { method: "POST" });
+    const sync = r.sync || {}, rep = r.report || {};
+    if (!r.ok) {
+      const why = sync.reason || (rep && rep.reason) || "未知原因";
+      toast("同步未完成:" + why, "err", 8000); return;
+    }
+    const p = sync.proxies || {}, a = sync.assignments || {};
+    toast(`同步完成:新增 ${p.added || 0} 条,更新 ${p.updated || 0} 条,停用 ${p.revoked || 0} 条,指派生效 ${a.applied || 0} 个账号`, "ok", 6000);
+    refreshProxies(); refreshAccounts();
+  } catch (e) { toast("同步失败:" + e.message, "err"); }
+  finally { btn.disabled = false; btn.textContent = old; }
 }
 async function delPoolProxy(id, used) {
   if (!await uiConfirm({ title: "删除代理", okText: "删除", danger: true,
