@@ -127,6 +127,9 @@ from .lead_push import (cleanup_outbox, lead_push_settings, outbox_stats,
                         probe_lead_push, push_comment_leads, retry_outbox,
                         validate_lead_push_url)
 from .selfcheck import run_selfcheck
+from .gdb15_open import (CSV_MIME, XLSX_MIME, OpenApiError, build_csv,
+                         build_xlsx, collect_leads, open_api_status,
+                         push_status, save_open_api_settings, since_days_ago)
 from .license import (effective_status, license_enforced, license_settings,
                       license_loop, verify as verify_license)
 from .quota import local_usage_snapshot, monitor_slot_usage, monthly_lead_usage
@@ -5502,6 +5505,9 @@ def _settings_dict() -> dict:
         "license_enforced": license_enforced(),
         "license_url": get_setting("license_url", ""),
         "license_api_key_set": bool(get_setting("license_api_key", "")),
+        # 开放 API：跟推送不是同一把 Key，单独记。
+        "gdb15_open_base_url": open_api_status()["base_url"],
+        "gdb15_open_api_key_set": open_api_status()["api_key_set"],
     }
 
 
@@ -5639,6 +5645,107 @@ async def test_lead_push_settings():
     # 走探测通道：失败的测试记录不该混进线索暂存箱，
     # 成功的测试记录也不该留在客户付费的线索池里。
     return await probe_lead_push()
+
+
+# ─────────── gdb15 开放 API：把 CRM 里的线索导回本机表格 ───────────
+class OpenApiSettingsIn(BaseModel):
+    base_url: str | None = None
+    api_key: str | None = None      # 留空=不修改已保存的 Key
+
+
+class OpenApiStatusIn(BaseModel):
+    status: str
+    note: str = ""
+
+
+@app.get("/api/gdb15/open/settings")
+async def get_open_api_settings():
+    """开放 API 的配置情况。永远不回传明文 Key。"""
+    return open_api_status()
+
+
+@app.put("/api/gdb15/open/settings")
+async def put_open_api_settings(body: OpenApiSettingsIn):
+    try:
+        return save_open_api_settings(body.base_url, body.api_key)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+
+
+@app.post("/api/gdb15/open/test")
+async def test_open_api():
+    """只拉一小页，确认地址和 Key 都能用。"""
+    try:
+        result = await collect_leads(page_size=5, max_leads=5)
+    except OpenApiError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "count": result["total"]}
+
+
+@app.get("/api/gdb15/open/leads.xlsx")
+async def export_open_api_leads_xlsx(days: int = 30, platform: str = "",
+                                     status: str = "", keyword: str = "",
+                                     limit: int = 2000):
+    """把 gdb15 的线索导成 Excel 表格。"""
+    if days < 0:
+        raise HTTPException(400, "天数不能是负数")
+    cap = max(1, min(int(limit or 2000), 5000))
+    try:
+        result = await collect_leads(
+            platform=platform, status=status, source_keyword=keyword,
+            since=since_days_ago(days), max_leads=cap)
+    except OpenApiError as e:
+        raise HTTPException(400, str(e)) from None
+    leads = result["leads"]
+    note = ""
+    if result["truncated"]:
+        note = (f"本次导出 {len(leads)} 条，已达单次上限 {cap} 条；"
+                f"还有更早的线索没导出，缩小时间范围可以拿到更完整的一段。")
+    payload = build_xlsx(leads, note=note)
+    filename = f"gdb15_leads_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+    return StreamingResponse(
+        iter([payload]),
+        media_type=XLSX_MIME,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload)),
+        },
+    )
+
+
+@app.get("/api/gdb15/open/leads.csv")
+async def export_open_api_leads_csv(days: int = 30, platform: str = "",
+                                    status: str = "", keyword: str = "",
+                                    limit: int = 2000):
+    """同一份线索的 CSV 版本，方便导进别的系统。"""
+    if days < 0:
+        raise HTTPException(400, "天数不能是负数")
+    cap = max(1, min(int(limit or 2000), 5000))
+    try:
+        result = await collect_leads(
+            platform=platform, status=status, source_keyword=keyword,
+            since=since_days_ago(days), max_leads=cap)
+    except OpenApiError as e:
+        raise HTTPException(400, str(e)) from None
+    payload = build_csv(result["leads"])
+    filename = f"gdb15_leads_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    return StreamingResponse(
+        iter([payload]),
+        media_type=CSV_MIME,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload)),
+        },
+    )
+
+
+@app.post("/api/gdb15/open/leads/{lead_id}/status")
+async def write_back_open_api_status(lead_id: str, body: OpenApiStatusIn):
+    """把跟进状态回写到 gdb15，让两边的漏斗口径一致。"""
+    try:
+        return await push_status(lead_id, body.status, body.note)
+    except OpenApiError as e:
+        raise HTTPException(400, str(e)) from None
 
 
 class AiTestIn(BaseModel):

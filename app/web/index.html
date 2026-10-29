@@ -2734,6 +2734,75 @@
     </div>
   </div>
 
+  <!-- gdb15 开放 API(把 CRM 里的线索导回本机表格)-->
+  <div class="card" data-section="open-api">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-download"/></svg></span>
+      <h2>gdb15 开放 API <span class="sub">把 CRM 里的线索导成本地表格</span></h2>
+    </div>
+    <div class="stack">
+      <div class="form-grid cols-auto">
+        <div class="form-field">
+          <label for="open-api-url">接口地址</label>
+          <input id="open-api-url" type="url" inputmode="url" autocomplete="url"
+            placeholder="https://www.gdb15.com/api/v1/open">
+          <p class="field-help">留空则沿用上面「线索推送」的 gdb15 地址。</p>
+        </div>
+        <div class="form-field">
+          <label for="open-api-key">开放 API Key</label>
+          <div class="input-affix">
+            <input id="open-api-key" type="password" autocomplete="new-password"
+              placeholder="留空则不修改已保存的 Key">
+            <button class="input-action" type="button" onclick="toggleSecretInput('open-api-key',this)"
+              aria-label="显示开放 API Key" aria-pressed="false" title="显示或隐藏 API Key">
+              <svg><use href="#i-eye"/></svg>
+            </button>
+          </div>
+          <p class="field-help">与「线索推送」那把 Key 不是同一把。在 gdb15 后台「开放 API」页单独签发，完整 Key 只显示一次。</p>
+        </div>
+      </div>
+      <div class="form-grid cols-auto">
+        <div class="form-field">
+          <label for="open-api-days">导出范围</label>
+          <select id="open-api-days">
+            <option value="7">最近 7 天</option>
+            <option value="30" selected>最近 30 天</option>
+            <option value="90">最近 90 天</option>
+            <option value="0">全部</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label for="open-api-platform">平台</label>
+          <select id="open-api-platform">
+            <option value="">全部</option>
+            <option value="douyin">抖音</option>
+            <option value="xiaohongshu">小红书</option>
+            <option value="kuaishou">快手</option>
+            <option value="channels">视频号</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label for="open-api-status">状态</label>
+          <select id="open-api-status">
+            <option value="">全部</option>
+            <option value="PENDING">待跟进</option>
+            <option value="CONTACTED">已触达</option>
+            <option value="REPLIED">已回复</option>
+            <option value="CONVERTED">已成交</option>
+            <option value="LOST">已流失</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-actions">
+        <span class="status-text" id="open-api-msg" role="status" aria-live="polite"></span>
+        <button class="ghost" onclick="testOpenApi()"><svg><use href="#i-bolt"/></svg>测试连接</button>
+        <button class="ghost" onclick="exportOpenApi('csv')"><svg><use href="#i-download"/></svg>导出 CSV</button>
+        <button class="ghost" onclick="exportOpenApi('xlsx')"><svg><use href="#i-download"/></svg>导出 Excel</button>
+        <button onclick="saveOpenApiSettings()"><svg><use href="#i-check"/></svg>保存开放 API 设置</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 大模型 API(自动评论文案)-->
   <div class="card" data-section="ai">
     <div class="card-head">

@@ -4479,6 +4479,11 @@ async function loadSettings() {
       $("lead-push-key").placeholder = s.lead_push_api_key_set
         ? "已保存(留空=不修改)" : "API Key";
     }
+    if ($("open-api-url")) {
+      assign("open-api-url", "value", s.gdb15_open_base_url || "");
+      $("open-api-key").placeholder = s.gdb15_open_api_key_set
+        ? "已保存(留空=不修改)" : "开放 API Key";
+    }
     if ($("license-enabled")) {
       assign("license-enabled", "checked", !!s.license_enabled || !!s.license_enforced);
       // 已经授权过的机器不允许再关掉开关，否则套餐限制就形同虚设。
@@ -4517,6 +4522,75 @@ async function saveLeadPushSettings() {
     }
   });
 }
+// ─── gdb15 开放 API：把 CRM 里的线索导回本机表格 ───
+async function saveOpenApiSettings() {
+  const url = $("open-api-url").value.trim();
+  const key = $("open-api-key").value.trim();
+  $("open-api-msg").textContent = "保存中…";
+  await withBusy(evtBtn(), "保存中", async () => {
+    try {
+      const body = {};
+      if (url) body.base_url = url;
+      if (key) body.api_key = key;
+      const s = await api("/api/gdb15/open/settings", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      $("open-api-key").value = "";
+      $("open-api-key").placeholder = s.api_key_set
+        ? "已保存(留空=不修改)" : "开放 API Key";
+      $("open-api-url").value = s.base_url || "";
+      $("open-api-msg").textContent = "已保存 ✓";
+      toast("开放 API 设置已保存", "ok");
+    } catch (e) {
+      $("open-api-msg").textContent = "失败: " + e.message;
+      toast("保存失败:" + e.message, "err");
+    }
+  });
+}
+
+async function testOpenApi() {
+  $("open-api-msg").textContent = "测试中…";
+  await withBusy(evtBtn(), "测试中", async () => {
+    try {
+      const r = await api("/api/gdb15/open/test", { method: "POST" });
+      if (!r.ok) throw new Error(r.error || "连接失败");
+      $("open-api-msg").textContent = `连接正常，读到 ${r.count} 条线索`;
+      toast("开放 API 连接正常", "ok");
+    } catch (e) {
+      $("open-api-msg").textContent = "失败: " + e.message;
+      toast("测试失败:" + e.message, "err");
+    }
+  });
+}
+
+function _openApiExportParams() {
+  const params = new URLSearchParams();
+  params.set("days", $("open-api-days").value || "30");
+  const platform = $("open-api-platform").value;
+  if (platform) params.set("platform", platform);
+  const status = $("open-api-status").value;
+  if (status) params.set("status", status);
+  return params;
+}
+
+async function exportOpenApi(kind) {
+  const ext = kind === "csv" ? "csv" : "xlsx";
+  const params = _openApiExportParams();
+  $("open-api-msg").textContent = "导出中…";
+  await withBusy(evtBtn(), "导出中", async () => {
+    try {
+      await _downloadExcelReport(
+        `/api/gdb15/open/leads.${ext}?${params.toString()}`, `gdb15_leads.${ext}`);
+      $("open-api-msg").textContent = "已导出";
+      toast(`线索表格已导出（${ext.toUpperCase()}）`, "ok");
+    } catch (e) {
+      $("open-api-msg").textContent = "失败: " + e.message;
+      toast("导出失败:" + e.message, "err");
+    }
+  });
+}
+
 async function loadLeadPushOutbox() {
   try {
     const st = await api("/api/lead-push/outbox");
