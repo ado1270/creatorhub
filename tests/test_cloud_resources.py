@@ -150,6 +150,21 @@ class BundleApplyTests(ResourceTestBase):
             self.assertEqual(len(rows), 1)
             self.assertTrue(rows[0].enabled)
 
+    def test_unusable_cloud_proxy_is_not_added_to_pool(self):
+        """地址在本地用不了（没写端口）：不进池子。
+
+        进了池子就可能被「给账号批量分配」选中，账号就悄悄改走本机 IP ——
+        出口 IP 漂移是风控最爱盯的信号，宁可少一条也不能悄悄换出口。
+        """
+        result = resources.apply_bundle({
+            "proxies": [{"id": "cloud-1", "url": "http://proxy.example.com"}],
+            "assignments": [],
+        })
+        self.assertEqual(result["proxies"]["invalid"], 1)
+        self.assertEqual(result["proxies"]["added"], 0)
+        with db.get_session() as s:
+            self.assertEqual(len(s.exec(select(ProxyPool)).all()), 0)
+
     def test_sync_updates_url_of_known_cloud_proxy(self):
         """云端改了代理地址，本地要跟上 —— 云端对云端下发的代理是权威。"""
         self._add_proxy(url="http://old:1@1.1.1.1:8080",
@@ -195,6 +210,22 @@ class AssignmentTests(ResourceTestBase):
         with db.get_session() as s:
             rows = s.exec(select(DouyinAccount)).all()
             self.assertEqual(rows[0].proxy, "http://keep:me@5.5.5.5:1080")
+
+    def test_assignment_with_unusable_proxy_is_not_bound(self):
+        """指派的地址本地解析不了：账号不许被绑上去。"""
+        self._add_account(proxy="")
+        result = resources.apply_bundle({
+            "proxies": [],
+            "assignments": [{
+                "platform": "douyin", "accountKey": "dy-1",
+                "proxyId": "cloud-1", "proxyUrl": "http://proxy.example.com",
+                "proxyHost": "proxy.example.com:80", "boundProxyHost": "",
+            }],
+        })
+        self.assertEqual(result["assignments"]["applied"], 0)
+        with db.get_session() as s:
+            rows = s.exec(select(DouyinAccount)).all()
+            self.assertEqual(rows[0].proxy, "")
 
     def test_assignment_for_unknown_account_is_skipped(self):
         """云端台账里有这台机器上还没有的账号：跳过，不能凭空造账号。"""

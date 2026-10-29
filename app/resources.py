@@ -83,9 +83,21 @@ def _proxy_host_port(url: str) -> str:
 
 
 def _normalize(url: str) -> str:
-    """把云端给的地址规范成本地认得的格式（补协议头、密码转义）。"""
+    """把云端给的地址规范成本地认得的格式（补协议头、密码转义）。
+
+    规范不出来就返回空串。这条地址不能进代理池，更不能绑到账号上：
+    绑了等于给账号配了一个用不了的出口，账号会悄悄改走本机 IP ——
+    出口 IP 漂移正是风控最爱盯的信号。
+    """
     from .browser.manager import normalize_proxy
-    return normalize_proxy((url or "").strip())
+    from .browser.proxy import try_proxy_plan
+    text = (url or "").strip()
+    if not text:
+        return ""
+    normalized = normalize_proxy(text)
+    if not try_proxy_plan(normalized):
+        return ""
+    return normalized
 
 
 def collect_local_resources() -> dict:
@@ -140,6 +152,7 @@ def apply_bundle(bundle: dict) -> dict:
     added = updated = adopted = revoked = 0
     applied = 0
     skipped = 0
+    invalid = 0
 
     with get_session() as session:
         all_rows = session.exec(select(ProxyPool)).all()
@@ -156,6 +169,9 @@ def apply_bundle(bundle: dict) -> dict:
             cloud_ids.add(remote_id)
             url = _normalize(str(item.get("url") or ""))
             if not url:
+                # 云端这条地址在本地用不了（多半是没写端口）。不进池子，
+                # 免得被「给账号批量分配」选中，账号就悄悄换出口了。
+                invalid += 1
                 continue
             label = str(item.get("label") or "").strip()
 
@@ -237,7 +253,10 @@ def apply_bundle(bundle: dict) -> dict:
 
     return {
         "ok": True,
-        "proxies": {"added": added, "updated": updated, "adopted": adopted, "revoked": revoked},
+        "proxies": {
+            "added": added, "updated": updated, "adopted": adopted,
+            "revoked": revoked, "invalid": invalid,
+        },
         "assignments": {"applied": applied, "skipped": skipped},
     }
 
