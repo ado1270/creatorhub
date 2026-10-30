@@ -825,6 +825,18 @@ input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color:var(--d
 }
 .appearance-choice:has(input:checked) { background:var(--selected-surface); box-shadow:0 0 0 1px var(--acc),inset 0 1px 0 var(--glass-rim); }
 .pill { font-weight:550; }
+.intent-badge { margin-right:6px; font-size:11px; vertical-align:1px; }
+.intent-tier-lead { background:var(--success-soft); color:var(--success); border:1px solid color-mix(in srgb,var(--success) 24%,transparent); }
+.intent-tier-review { background:var(--warn-soft); color:var(--warn); border:1px solid color-mix(in srgb,var(--warn) 30%,transparent); }
+.intent-tier-none { background:var(--surface-2); color:var(--mut); border:1px solid var(--line); }
+.scan-info { font-size:11px; line-height:1.35; color:var(--mut); margin-top:2px; }
+.intent-ai-result { display:grid; gap:6px; }
+.intent-ai-sample { display:flex; align-items:center; gap:8px; font-size:13px; padding:6px 8px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface); }
+.intent-ai-sample .mut { margin-left:auto; font-size:12px; }
+.intent-ai-tier-lead { background:var(--success-soft); color:var(--success); padding:2px 8px; border-radius:999px; font-size:12px; }
+.intent-ai-tier-review { background:var(--warn-soft); color:var(--warn); padding:2px 8px; border-radius:999px; font-size:12px; }
+.intent-ai-tier-drop { background:var(--surface-2); color:var(--mut); padding:2px 8px; border-radius:999px; font-size:12px; }
+.intent-ai-tier-none { background:var(--surface-2); color:var(--mut); padding:2px 8px; border-radius:999px; font-size:12px; }
 .pill.paused { background:var(--surface-2); color:var(--mut); border-color:var(--line); }
 .pill.paused::before { border-radius:0; background:linear-gradient(90deg,currentColor 0 2px,transparent 2px 4px,currentColor 4px 6px); }
 .pill.toggle:hover { filter:none; box-shadow:0 0 0 2px var(--acc-ring); }

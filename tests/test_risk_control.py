@@ -784,10 +784,14 @@ risk_control:
         now = datetime(2026, 8, 7, 0, 0, 0)
         controller.record_success(account_id, OperationKind.READ_HEAVY, now=now)
 
+        # 重读间隔现为 25 秒（上限，不是节奏）：间隔内挡住，间隔外放行。
         too_soon = controller.preflight(
-            account_id, OperationKind.READ_HEAVY, now=now + timedelta(seconds=30))
+            account_id, OperationKind.READ_HEAVY, now=now + timedelta(seconds=10))
         self.assertFalse(too_soon.allowed)
         self.assertEqual(too_soon.signal, "kind_gap")
+        self.assertTrue(controller.preflight(
+            account_id, OperationKind.READ_HEAVY,
+            now=now + timedelta(seconds=30)).allowed)
 
         controller.record_failure(
             account_id, OperationKind.READ_HEAVY, "HTTP 429",
@@ -805,6 +809,49 @@ risk_control:
 
         self.assertEqual(ordered, [
             (1, 10), (3, 20), (5, None), (2, 10), (4, 20)])
+
+    def test_anonymous_targets_share_one_bucket_in_the_rotation(self):
+        """匿名任务共用一个桶，否则轮转退化成「匿名全跑完再轮到账号」。"""
+        rows = [(1, 10), (2, 10), (3, 20), (4, 20), (5, None), (6, None)]
+
+        ordered = _round_robin_by_account(rows)
+
+        self.assertEqual(ordered, [
+            (1, 10), (3, 20), (5, None), (2, 10), (4, 20), (6, None)])
+
+    def test_due_comment_watches_are_scanned_round_robin_by_account(self):
+        """评论监控也要按号交错：一个号不能独占一整轮扫描。"""
+        account_a = self._account()
+        account_b = self._account()
+        past = datetime.utcnow() - timedelta(hours=2)
+        with db.get_session() as session:
+            for index, account_id in enumerate([account_a, account_a,
+                                                account_b, account_b]):
+                session.add(CommentWatch(
+                    platform="douyin", kind="video", aweme_id=f"aw-{index}",
+                    account_id=account_id, enabled=True,
+                    created_at=past, interval_seconds=3600))
+            session.commit()
+
+        engine = MonitorEngine(self.cfg, _BrowserStub())
+        scanned: list[int] = []
+
+        async def fake_scan(watch_id):
+            scanned.append(watch_id)
+            return {"ok": True}
+
+        engine.scan_comment_watch = fake_scan
+        asyncio.run(engine._scan_comment_watches())
+
+        with db.get_session() as session:
+            owner = {w.id: w.account_id
+                     for w in session.exec(select(CommentWatch)).all()}
+        owners = [owner[watch_id] for watch_id in scanned]
+        self.assertEqual(len(owners), 4)
+        # 相邻两条必须来自不同账号。
+        self.assertNotEqual(owners[0], owners[1])
+        self.assertNotEqual(owners[1], owners[2])
+        self.assertNotEqual(owners[2], owners[3])
 
     def test_scan_target_respects_light_read_budget_without_advancing_scan(self):
         account_id = self._account()

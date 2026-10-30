@@ -12,6 +12,7 @@ import httpx
 from sqlalchemy import func
 from sqlmodel import select
 
+from . import intent_ai
 from .db import get_session
 from .models import LeadPushOutbox
 from .settings import get_setting
@@ -120,6 +121,45 @@ def _matched_terms(text: str, terms: list) -> list[str]:
     return [str(term) for term in terms if str(term).casefold() in folded]
 
 
+def _client_intent_level(comment: dict) -> str:
+    """把本地判定翻成 gdb15 的意向等级；判不准就留空让服务端自己判。
+
+    以前 payload 里没有 intentLevel，gdb15 只能按它自己的词库重算一遍。
+    后果很实在：本地大模型判成 95 分的「车在哪」（没撞上服务端词库里的词）
+    在 CRM 里落成中等意向，而手机端提醒只对高意向触发 —— 抓到买家和手机响
+    之间断掉了一环。服务端一直支持「客户端判过就信客户端」，这里把结论带上。
+
+    只带判得动的：撞意向词或 AI 分数过高意向线算 HIGH，灰区给 MEDIUM（不打扰
+    手机），AI 没开又没撞词的直接留空。
+    """
+    source = str(comment.get("intent_source") or "")
+    if source == "keyword":
+        return "HIGH"
+    try:
+        score = int(comment.get("intent_score")
+                    if comment.get("intent_score") is not None else -1)
+    except (TypeError, ValueError):
+        score = -1
+    cfg = intent_ai.config()
+    if cfg is None:
+        return ""
+    if score >= int(cfg.high):
+        return "HIGH"
+    if score >= int(cfg.review):
+        return "MEDIUM"
+    return ""
+
+
+def _payload_comment_ids(payloads: list[dict]) -> list[str]:
+    """这批 payload 对应的 comment_id，用来给本地评论盖送达回执。"""
+    out = []
+    for payload in payloads:
+        cid = str(payload.get("commentId") or "").strip()
+        if cid:
+            out.append(cid)
+    return out
+
+
 def build_payloads(
     comments: list[dict],
     *,
@@ -141,15 +181,27 @@ def build_payloads(
         if not text or not item_id or not comment_id:
             continue
         matched = _matched_terms(text, intent_keywords or [])
+        # AI 判定结果优先占位：人工在 gdb15 里第一眼要看到的是不是一条真客户，
+        # 意向词只是补充说明。
+        try:
+            ai_score = int(comment.get("intent_score")
+                           if comment.get("intent_score") is not None else -1)
+        except (TypeError, ValueError):
+            ai_score = -1
+        ai_label = str(comment.get("intent_label") or "").strip()[:24]
+        verdict = (f"AI {ai_score}分 {ai_label}".strip() if ai_score >= 0 else ai_label)
         payload = {
             "platform": platform,
             "sourceUrl": _source_url(platform, item_id),
             "commentId": comment_id,
             "commentText": text[:2000],
-            "intentKeyword": intent_label or ", ".join(matched),
+            "intentKeyword": intent_label or verdict or ", ".join(matched),
             "capturedAt": _captured_at(int(comment.get("create_time") or 0)),
             "source": "CREATORHUB",
         }
+        level = _client_intent_level(comment)
+        if level:
+            payload["intentLevel"] = level
         attribution = str(source_keyword or "").strip()[:120]
         if attribution:
             payload["sourceKeyword"] = attribution
@@ -587,7 +639,7 @@ async def push_comment_leads(
     settings = lead_push_settings()
     if not settings["enabled"] or not comments:
         return {"enabled": settings["enabled"], "pushed": 0, "skipped": 0,
-                "errors": [], "queued": 0}
+                "errors": [], "queued": 0, "handled": []}
 
     payloads = build_payloads(
         comments, platform=platform, item_id=item_id,
@@ -601,7 +653,8 @@ async def push_comment_leads(
         queued = enqueue_payloads(
             payloads, "gdb15 URL 或 API Key 未配置")
         return {"enabled": True, "pushed": 0, "skipped": skipped,
-                "errors": ["gdb15 URL 或 API Key 未配置"], "queued": queued}
+                "errors": ["gdb15 URL 或 API Key 未配置"], "queued": queued,
+                "handled": _payload_comment_ids(payloads)}
     failed, errors = await send_payloads(payloads)
     queued = enqueue_payloads(failed, "推送失败", reasons=errors)
     # 按对象身份挑出推成功的，一次采集几百条时别拿字典相等性去比。
@@ -616,4 +669,7 @@ async def push_comment_leads(
             # 否则客户以为没送到，又去手工补推一遍。
             log.warning("gdb15 送达回执更新失败（线索已送达，不影响结果）: %r", exc)
     return {"enabled": True, "pushed": len(payloads) - len(failed),
-            "skipped": skipped, "errors": errors[:5], "queued": queued}
+            "skipped": skipped, "errors": errors[:5], "queued": queued,
+            # 送出去的进 gdb15，没送出去的进暂存箱等补推：
+            # 两种都算「责任已接管」，盖上送达回执，补推工具只挑真正没人管的。
+            "handled": _payload_comment_ids(payloads)}

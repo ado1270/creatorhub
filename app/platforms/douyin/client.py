@@ -1264,6 +1264,61 @@ class DouyinClient:
         )
         return data or {}
 
+    async def fetch_recent_comments(self, aweme_id: str, *, max_pages: int = 4,
+                                   max_age_seconds: int = 0,
+                                   with_replies: bool = True,
+                                   max_reply_pages: int = 1) -> List[dict]:
+        """只拉最近一段时间内的评论(评论监控用)。
+
+        评论监控要的是「刚出现的新评论」,不是把一条视频的历史评论全搬一遍。
+        全量拉取(max_pages=30 + 每条评论的回复全拉)在热门视频上单轮能打出
+        上百次请求:风控暴露面和代理消耗都是数量级的浪费,而监控位一旦上到
+        几百条,这个浪费会直接压垮账号。
+
+        这里按「够用就停」:
+        - 一级评论按时间倒序返回,整页都早于时间窗就停,不再往下翻;
+        - 只有时间窗内的评论才去拉回复 —— 老评论的老回复对监控没有意义,
+          而新回复的父评论一定也在时间窗内(回复不会早于它的父评论)。
+        """
+        out: List[dict] = []
+        cursor = 0
+        cutoff = 0
+        if max_age_seconds and max_age_seconds > 0:
+            cutoff = int(time.time()) - int(max_age_seconds)
+        pages = max(1, min(int(max_pages or 1), 30))
+        for _ in range(pages):
+            page = await self.fetch_comments_page(aweme_id, cursor)
+            comments = page.get("comments") or []
+            if not comments:
+                break
+            out.extend(comments)
+            if with_replies:
+                for c in comments:
+                    if cutoff and int(c.get("create_time") or 0) < cutoff:
+                        continue
+                    if int(c.get("reply_comment_total") or 0) <= 0:
+                        continue
+                    cid = str(c.get("cid") or "")
+                    if not cid:
+                        continue
+                    rcur = 0
+                    for _ in range(max(1, min(int(max_reply_pages or 1), 12))):
+                        rp = await self.fetch_replies_page(aweme_id, cid, rcur)
+                        out.extend(rp.get("comments") or [])
+                        if not rp.get("has_more"):
+                            break
+                        rcur = rp.get("cursor") or 0
+            if cutoff:
+                oldest = min(int(c.get("create_time") or 0) for c in comments)
+                if oldest and oldest < cutoff:
+                    # 这一页已经出现过期评论,后面的只会更旧 —— 但这一页里
+                    # 仍在时间窗内的评论的回复必须先拉完,所以判断放在回复之后。
+                    break
+            if not page.get("has_more"):
+                break
+            cursor = page.get("cursor") or 0
+        return out
+
     async def fetch_all_comments(self, aweme_id: str, max_pages: int = 30,
                                  with_replies: bool = True, max_reply_pages: int = 12
                                  ) -> List[dict]:

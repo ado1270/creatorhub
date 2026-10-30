@@ -36,6 +36,7 @@ function fixture() {
   for (const name of ['esc','beginViewRequest','watchBaseName','watchName','contentCaptureBounds','contentCapturedTime',
     'watchRecordConfig','watchRecordSource','updateWatchRecordScope','populateWatchRecordSource','showWatchRecords','backToWatchTasks',
     'watchRecordSourceMarkup','watchRecordTimeMarkup','prepareWatchRecordLoad','watchRecordLoadError','cacheWatchRecordSources',
+    'intentBadgeMarkup',
     'danmakuTime','refreshComments','refreshDanmaku','_moduleReportParams','delWatch','delDanmakuWatch'])
     vm.runInContext(fn(name),context);
   return {context,$,requests,calls,run:code=>vm.runInContext(code,context)};
@@ -71,6 +72,21 @@ async function run() {
     assert.ok(time.includes('2026-09-08T08:00:00.123Z')&&time.includes('published:123'));
     f.context.row.captured_at=null;
     assert.ok(f.run(`watchRecordTimeMarkup('${kind}',row)`).includes('未记录'));
+    if(kind==='comment'){
+      // AI 意向徽章：高意向/待人工要能看见，分数与依据放 title；无判定不渲染。
+      f.context.row.intent_tier='lead';f.context.row.intent_score=95;
+      f.context.row.intent_label='询价';f.context.row.intent_reason='问价';f.context.row.intent_source='ai';
+      const badge=f.run('intentBadgeMarkup(row)');
+      assert.ok(badge.includes('intent-tier-lead')&&badge.includes('高意向 95')&&badge.includes('95 分 · 询价 · 问价'));
+      f.context.row.intent_tier='review';f.context.row.intent_score=-1;f.context.row.intent_source='none';
+      assert.ok(f.run('intentBadgeMarkup(row)').includes('intent-tier-review'));
+      f.context.row={id:2,watch_id:99,platform:'douyin',aweme_id:'a',create_time:1,captured_at:null};
+      assert.equal(f.run('intentBadgeMarkup(row)'),'');
+      f.context.row={id:3,watch_id:99,platform:'douyin',aweme_id:'<b>x</b>',intent_tier:'lead',intent_score:95,
+        intent_label:'<img onerror="attack()">',intent_reason:'<script>bad()</script>',intent_source:'ai',create_time:1,captured_at:null};
+      const safe=f.run('intentBadgeMarkup(row)');
+      assert.ok(!safe.includes('<img onerror=')&&!safe.includes('<script>'),'intent badge must escape model text');
+    }
 
     f.$(kind+'-captured-from').value='2026-03-08';f.$(kind+'-captured-to').value='2026-03-08';
     const bounds=JSON.parse(f.run(`JSON.stringify(contentCaptureBounds('${kind}'))`));

@@ -2623,6 +2623,32 @@
       </div>
     </div>
   </div>
+  <div class="card" data-section="mobile-intake">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-qr"/></svg></span>
+      <h2>手机采集入口 <span class="sub">手机上刷到好作品，直接丢进评论监控</span></h2>
+    </div>
+    <div class="stack">
+      <p class="field-help">手机上不用装软件，也不用放账号和 Cookie。扫一次码，
+        在抖音/快手里点「分享 → 复制链接」，把整段文案贴进去提交，
+        这台电脑会自己去取、自己建监控 —— 账号、指纹、出口仍然只在本机。</p>
+      <div id="intake-qr-wrap" style="display:none;align-items:center;gap:16px;flex-wrap:wrap">
+        <img id="intake-qr" alt="手机采集入口二维码" width="200" height="200"
+          style="border-radius:8px;background:#fff;padding:8px">
+        <div class="form-field" style="flex:1;min-width:240px">
+          <label for="intake-url">手机打开这个链接</label>
+          <input id="intake-url" readonly placeholder="点「生成手机入口」后显示">
+          <p class="field-help">二维码 30 分钟内有效，只能扫一次。</p>
+        </div>
+      </div>
+      <div class="form-actions">
+        <span class="status-text" id="intake-msg" role="status" aria-live="polite"></span>
+        <button class="ghost" onclick="refreshIntake()"><svg><use href="#i-refresh"/></svg>立即接收</button>
+        <button onclick="createIntakeLink()"><svg><use href="#i-qr"/></svg>生成手机入口</button>
+      </div>
+      <div id="intake-list"></div>
+    </div>
+  </div>
   <div class="card appearance-card" data-section="appearance">
     <div class="card-head">
       <span class="card-ic"><svg aria-hidden="true"><use href="#i-sun"/></svg></span>
@@ -2851,6 +2877,76 @@
         <button class="ghost" onclick="testAi()"><svg><use href="#i-bolt"/></svg>测试连通性</button>
         <button onclick="saveAiSettings()"><svg><use href="#i-check"/></svg>保存 AI 设置</button>
       </div>
+    </div>
+  </div>
+  <!-- AI 意向判定(评论线索打分)-->
+  <div class="card" data-section="intent-ai">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-bolt"/></svg></span>
+      <h2>AI 意向判定 <span class="sub">给评论打分，关键词不再一票否决</span></h2>
+    </div>
+    <div class="stack">
+      <label class="switch-row">
+        <input type="checkbox" id="intent-ai-enabled">
+        <span class="switch-copy"><b>启用 AI 判定评论意向</b><span>关闭时按高意向词硬筛；开启后关键词命中仍算高意向，AI 负责捞回说法不同的客户</span></span>
+      </label>
+      <div class="form-grid">
+        <div class="form-field">
+          <label for="intent-ai-base">接口地址</label>
+          <input id="intent-ai-base" type="url" inputmode="url" autocomplete="url" placeholder="https://api.deepseek.com/v1 或 http://localhost:11434/v1">
+        </div>
+        <div class="form-field">
+          <label for="intent-ai-model">模型名称</label>
+          <input id="intent-ai-model" autocomplete="off" placeholder="deepseek-chat / qwen2.5:1.5b">
+        </div>
+        <div class="form-field">
+          <label for="intent-ai-key">API Key</label>
+          <div class="input-affix">
+            <input id="intent-ai-key" type="password" autocomplete="new-password" placeholder="留空则不修改已保存的 Key">
+            <button class="input-action" type="button" onclick="toggleSecretInput('intent-ai-key',this)" aria-label="显示 API Key" aria-pressed="false" title="显示或隐藏 API Key"><svg><use href="#i-eye"/></svg></button>
+          </div>
+          <div class="field-help">本地 Ollama 可留空；只存本地数据库，不回显</div>
+        </div>
+        <div class="form-field">
+          <label for="intent-ai-high">高意向分数线</label>
+          <input id="intent-ai-high" type="number" inputmode="numeric" min="1" max="100" step="1" placeholder="70">
+          <div class="field-help">达到即算高意向，直接进线索</div>
+        </div>
+        <div class="form-field">
+          <label for="intent-ai-review">待人工分数线</label>
+          <input id="intent-ai-review" type="number" inputmode="numeric" min="0" max="100" step="1" placeholder="40">
+          <div class="field-help">这条到高分线之间：入库并标注，交人工判断</div>
+        </div>
+        <div class="form-field">
+          <label for="intent-ai-batch">每批评论条数</label>
+          <input id="intent-ai-batch" type="number" inputmode="numeric" min="1" max="30" step="1" placeholder="12">
+          <div class="field-help">本地模型建议 4~8，云端可以 12~20</div>
+        </div>
+        <div class="form-field">
+          <label for="intent-ai-timeout">请求超时（秒）</label>
+          <input id="intent-ai-timeout" type="number" inputmode="numeric" min="3" max="300" step="1" placeholder="60">
+          <div class="field-help">本地模型首次加载权重慢，建议 60 秒以上</div>
+        </div>
+      </div>
+      <div class="form-field">
+        <label for="intent-ai-business">你的生意（写进提示词）</label>
+        <textarea id="intent-ai-business" rows="2" placeholder="例：在抖音卖二手电动车，广东省内自提，客户常在评论区问价格、能不能到某个城市、怎么联系"></textarea>
+        <div class="field-help">写清卖什么、卖给谁、客户会怎么问，判分会明显更准</div>
+      </div>
+      <label class="switch-row">
+        <input type="checkbox" id="intent-ai-push-review">
+        <span class="switch-copy"><b>灰区也推给 gdb15</b><span>关闭时「待人工确认」只留在本地，你在评论记录里看；打开后灰区一并推送</span></span>
+      </label>
+      <div class="form-note">
+        <svg aria-hidden="true"><use href="#i-info"/></svg>
+        <span>时间范围、地区、排除词仍是硬条件，AI 只判「有没有意向」。整批调用失败时自动回退高意向词，不会因为 AI 挂了就没有线索。</span>
+      </div>
+      <div class="form-actions">
+        <span class="status-text" id="intent-ai-msg" role="status" aria-live="polite"></span>
+        <button class="ghost" onclick="testIntentAi()"><svg><use href="#i-bolt"/></svg>试判几条</button>
+        <button onclick="saveIntentAiSettings()"><svg><use href="#i-check"/></svg>保存 AI 意向设置</button>
+      </div>
+      <div id="intent-ai-result" class="intent-ai-result" hidden></div>
     </div>
   </div>
   <div class="card" id="engine-settings-card" data-section="engine">
@@ -3453,7 +3549,7 @@
         </div>
         <div class="form-grid cols-auto">
           <div class="form-field"><label for="w-regions">地区筛选(可选)</label><input id="w-regions" placeholder="如：广东,东莞,深圳" aria-describedby="w-region-help"><p id="w-region-help" class="field-help">按评论 IP 属地筛选；留空表示不限地区。</p></div>
-          <div class="form-field"><label for="w-intent">高意向词(可选)</label><input id="w-intent" placeholder="如：多少钱,报价,怎么买" aria-describedby="w-intent-help"><p id="w-intent-help" class="field-help">留空不过滤；填多个词时命中任一项才保留。</p></div>
+          <div class="form-field"><label for="w-intent">高意向词(可选)</label><input id="w-intent" placeholder="如：多少钱,报价,怎么买" aria-describedby="w-intent-help"><p id="w-intent-help" class="field-help">留空不过滤；填多个词时命中任一项才保留。开启「AI 意向判定」后这里变成加分项：命中算高意向，没命中但 AI 判定是客户的也会留下。</p></div>
           <div class="form-field"><label for="w-exclude">排除词(可选)</label><input id="w-exclude" placeholder="如：广告,同行,代运营"></div>
         </div>
         <div class="form-actions">
@@ -3538,6 +3634,9 @@
         <select id="comment-tag" onchange="onCommentMetaFilter()" aria-label="按标签筛选评论"><option value="">全部标签</option></select>
         <select id="comment-type" onchange="refreshComments(true)" aria-label="按评论类型筛选">
           <option value="">全部评论</option><option value="top">仅主评论</option><option value="reply">仅回复</option>
+        </select>
+        <select id="comment-intent" onchange="refreshComments(true)" aria-label="按意向分层筛选">
+          <option value="">全部意向</option><option value="lead">仅高意向</option><option value="review">待人工确认</option>
         </select>
         <input id="comment-min-likes" type="number" min="0" step="1" placeholder="最低点赞" aria-label="评论最低点赞数" onchange="refreshComments(true)">
         <select id="comment-sort" onchange="refreshComments(true)" aria-label="评论排序">

@@ -312,6 +312,9 @@ class CommentWatch(SQLModel, table=True):
     enabled: bool = True
     last_scan_at: Optional[datetime] = None
     last_error: str = ""
+    # 本轮抓取的说明文字（抓到多少条 / 过筛多少条 / 为什么是 0）。
+    # 只靠 last_error 表达不了「抓到了但被筛掉」，界面就会一片 0 且没有理由。
+    last_scan_info: str = ""
     comment_count: int = 0
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -360,6 +363,13 @@ class CommentRecord(SQLModel, table=True):
     like_count: int = 0
     create_time: int = 0                       # 评论时间(unix 秒)
     reply_to: str = ""                         # 上级评论 cid(子评论时)
+    intent_score: int = -1                     # AI 意向分 0~100；-1=未经 AI 判定
+    intent_label: str = ""                     # 判定类别（询价 / 同行 …）
+    intent_reason: str = ""                    # 模型给的一句话依据，给人工看
+    intent_source: str = ""                    # ai | keyword | none
+    # 送达回执：这条评论的推送责任处理完（已送达 / 已进暂存箱）就盖上时间戳。
+    # 空值意味着「一条都没推出去」，是补推的依据，也是排障时的唯一线索。
+    pushed_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 

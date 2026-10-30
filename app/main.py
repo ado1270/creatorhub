@@ -27,7 +27,7 @@ from fastapi import Body, FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field as PydanticField, StrictInt, ValidationError
-from sqlalchemy import delete, func, or_, update
+from sqlalchemy import case, delete, func, or_, update
 from sqlmodel import select
 
 from .browser import (BrowserManager, cookie_string_to_state,
@@ -63,6 +63,7 @@ from .platforms.douyin import (
 )
 from .config import load_config
 from .db import get_session, init_db
+from . import intent_ai
 from .account_merge import (
     cleanup_merged_profiles,
     duplicate_xhs_account_ids,
@@ -132,6 +133,8 @@ from .gdb15_open import (CSV_MIME, XLSX_MIME, OpenApiError, build_csv,
                          push_status, save_open_api_settings, since_days_ago)
 from .license import (effective_status, license_enforced, license_settings,
                       license_loop, verify as verify_license)
+from .intake import (create_mobile_session, fetch_recent as fetch_intake_recent,
+                     intake_loop, intake_ready, process_pending)
 from .quota import local_usage_snapshot, monitor_slot_usage, monthly_lead_usage
 from .quality import rank_works
 from .transport_matrix import (
@@ -652,6 +655,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[startup] 授权校验失败(不影响启动): {e!r}")
     _license_task = asyncio.create_task(license_loop(cfg))
+    # 手机采集入口：客户在手机上提交作品，本机定期去取件建监控。
+    # 没配 gdb15 地址时这条循环自己就不启动，不影响正常采集。
+    _intake_task = asyncio.create_task(intake_loop())
     yield
     if _webhook_delivery_task:
         _webhook_delivery_task.cancel()
@@ -659,6 +665,10 @@ async def lifespan(app: FastAPI):
         _webhook_delivery_task = None
     _license_task.cancel()
     await asyncio.gather(_license_task, return_exceptions=True)
+    if _intake_task:
+        _intake_task.cancel()
+        await asyncio.gather(_intake_task, return_exceptions=True)
+        _intake_task = None
     if _lead_push_retry_task:
         _lead_push_retry_task.cancel()
         await asyncio.gather(_lead_push_retry_task, return_exceptions=True)
@@ -5477,6 +5487,17 @@ class SettingsIn(BaseModel):
     ai_model: str | None = None
     ai_prompt: str | None = None
     ai_temperature: str | None = None
+    # AI 意向判定（给评论线索打分，OpenAI 兼容接口，可与文案生成用同一家）
+    intent_ai_enabled: bool | None = None
+    intent_ai_base_url: str | None = None
+    intent_ai_api_key: str | None = None      # 留空=不改(避免误清空已存的 key)
+    intent_ai_model: str | None = None
+    intent_ai_business: str | None = None
+    intent_ai_high: str | None = None
+    intent_ai_review: str | None = None
+    intent_ai_batch: str | None = None
+    intent_ai_timeout: str | None = None
+    intent_ai_push_review: bool | None = None   # 灰区（待人工）是否也推 gdb15
     lead_push_enabled: bool | None = None
     lead_push_url: str | None = None
     lead_push_api_key: str | None = None      # 留空=不修改已保存的 Key
@@ -5497,6 +5518,19 @@ def _settings_dict() -> dict:
         "ai_temperature": get_setting("ai_temperature", "0.9"),
         # 不回传明文 key,只告知是否已配置
         "ai_api_key_set": bool(get_setting("ai_api_key", "")),
+        "intent_ai_enabled": get_setting("intent_ai_enabled", "0") == "1",
+        "intent_ai_base_url": get_setting("intent_ai_base_url", ""),
+        "intent_ai_model": get_setting("intent_ai_model", ""),
+        "intent_ai_business": get_setting("intent_ai_business", ""),
+        "intent_ai_high": get_setting("intent_ai_high", "") or str(intent_ai.DEFAULT_HIGH),
+        "intent_ai_review": (get_setting("intent_ai_review", "")
+                             or str(intent_ai.DEFAULT_REVIEW)),
+        "intent_ai_batch": (get_setting("intent_ai_batch", "")
+                            or str(intent_ai.DEFAULT_BATCH)),
+        "intent_ai_timeout": (get_setting("intent_ai_timeout", "") or "60"),
+        "intent_ai_push_review": get_setting("intent_ai_push_review", "0") == "1",
+        "intent_ai_api_key_set": bool(get_setting("intent_ai_api_key", "")),
+        "intent_ai_ready": intent_ai.config() is not None,
         "lead_push_enabled": get_setting("lead_push_enabled", "0") == "1",
         "lead_push_url": get_setting(
             "lead_push_url", "https://www.gdb15.com/api/v1/leads/webhook"),
@@ -5591,6 +5625,33 @@ async def put_settings(body: SettingsIn):
         set_setting("ai_temperature", (body.ai_temperature or "0.9").strip())
     if body.ai_api_key:    # 仅在传了非空值时更新,留空=保留原 key
         set_setting("ai_api_key", body.ai_api_key.strip())
+    if body.intent_ai_enabled is not None:
+        set_setting("intent_ai_enabled", "1" if body.intent_ai_enabled else "0")
+    if body.intent_ai_push_review is not None:
+        set_setting("intent_ai_push_review", "1" if body.intent_ai_push_review else "0")
+    if body.intent_ai_base_url is not None:
+        set_setting("intent_ai_base_url", body.intent_ai_base_url.strip())
+    if body.intent_ai_model is not None:
+        set_setting("intent_ai_model", body.intent_ai_model.strip())
+    if body.intent_ai_business is not None:
+        set_setting("intent_ai_business", body.intent_ai_business.strip()[:400])
+    for key, raw, lo, hi in (("intent_ai_high", body.intent_ai_high, 1, 100),
+                             ("intent_ai_review", body.intent_ai_review, 0, 100),
+                             ("intent_ai_batch", body.intent_ai_batch, 1, 30),
+                             ("intent_ai_timeout", body.intent_ai_timeout, 3, 300)):
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            set_setting(key, "")
+            continue
+        try:
+            value = int(float(text))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "意向分数线 / 每批条数须为数字")
+        set_setting(key, str(max(lo, min(hi, value))))
+    if body.intent_ai_api_key:
+        set_setting("intent_ai_api_key", body.intent_ai_api_key.strip())
     if body.lead_push_enabled is not None:
         set_setting("lead_push_enabled", "1" if body.lead_push_enabled else "0")
     if body.lead_push_url is not None:
@@ -5785,6 +5846,59 @@ async def ai_test(body: AiTestIn):
 class ShareLinksIn(BaseModel):
     share_text: str
     limit: int = 10
+
+
+class IntentAITestIn(BaseModel):
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    business: str | None = None
+    high: str | None = None
+    review: str | None = None
+    comments: list[str] = PydanticField(default_factory=list)
+
+
+_INTENT_TEST_SAMPLES = ["多少钱能卖？", "这车还在不", "路过，老板发大财",
+                        "你们也是收车的吧", "怎么联系，我要了"]
+
+
+@app.post("/api/settings/intent-ai-test")
+async def intent_ai_test(body: IntentAITestIn):
+    """拿样例评论跑一次意向判定，让客户先看清打分口径，再决定开不开。"""
+    def _pick(raw, key, default=""):
+        return str(raw if raw is not None else get_setting(key, "")).strip()
+
+    cfg_ai = intent_ai.IntentAIConfig(
+        base_url=_pick(body.base_url, "intent_ai_base_url").rstrip("/"),
+        api_key=body.api_key or get_setting("intent_ai_api_key", ""),
+        model=_pick(body.model, "intent_ai_model"),
+        business=_pick(body.business, "intent_ai_business")[:400],
+        high=intent_ai._number(body.high if body.high is not None
+                               else get_setting("intent_ai_high", ""),
+                               intent_ai.DEFAULT_HIGH, 1, 100),
+        review=intent_ai._number(body.review if body.review is not None
+                                 else get_setting("intent_ai_review", ""),
+                                 intent_ai.DEFAULT_REVIEW, 0, 100),
+        timeout=float(intent_ai._number(get_setting("intent_ai_timeout", ""), 60, 3, 300)),
+    )
+    if not (cfg_ai.base_url and cfg_ai.model):
+        raise HTTPException(400, "请先填写接口地址与模型名称")
+    texts = [t.strip()[:160] for t in (body.comments or []) if str(t).strip()]
+    if not texts:
+        texts = list(_INTENT_TEST_SAMPLES)
+    samples = [{"text": t} for t in texts[:20]]
+    try:
+        verdicts = await intent_ai.score(samples, cfg_ai)
+    except intent_ai.IntentAIError as exc:
+        return {"ok": False, "error": f"{exc}(检查接口地址 / Key / 模型 / 网络)"}
+    items = []
+    for sample, verdict in zip(samples, verdicts):
+        call = intent_ai.decide(sample, verdict, cfg_ai, [])
+        items.append({"text": sample["text"], "score": call["score"],
+                      "label": call["label"], "reason": call["reason"],
+                      "tier": call["tier"]})
+    return {"ok": True, "model": cfg_ai.model, "high": cfg_ai.high,
+            "review": cfg_ai.review, "items": items}
 
 
 class ShareDownloadIn(BaseModel):
@@ -8150,6 +8264,40 @@ async def license_refresh():
     return effective_status(cfg)
 
 
+@app.get("/api/intake/status")
+async def intake_status():
+    """手机采集入口的现状：有没有接上、最近在手机上提交了什么。"""
+    from .intake import intake_base_url
+    recent = await fetch_intake_recent(20) if intake_ready() else []
+    return {
+        "enabled": intake_ready(),
+        "server": intake_base_url(),
+        "recent": recent,
+    }
+
+
+@app.post("/api/intake/mobile-link")
+async def intake_mobile_link():
+    """生成手机入口的一次性扫码链接。
+
+    链接里带的是一次性令牌，不是 API Key —— 别人截到二维码，
+    最多能往评论监控里塞作品，碰不到客户的线索和账号。
+    """
+    try:
+        result = await create_mobile_session()
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc))
+    return result
+
+
+@app.post("/api/intake/refresh")
+async def intake_refresh():
+    """立刻取一次件，把手机上提交的作品建进评论监控。"""
+    if not intake_ready():
+        raise HTTPException(400, "还没配置 gdb15 地址或 API Key")
+    return await process_pending()
+
+
 @app.post("/api/resources/sync")
 async def resources_sync():
     """手动把云端授权的代理池拉到本地，并回报本地实况。
@@ -9452,6 +9600,8 @@ def _watch_dict(w: CommentWatch) -> dict:
         "last_scan_at": w.last_scan_at.isoformat() if w.last_scan_at else None,
         "next_auto_run_at": utc_iso(row_deadline(w, cfg, kind="comment_watch")),
         "last_error": w.last_error,
+        # 本轮抓到多少 / 过筛多少 / 判为线索多少 —— 让 0 有解释。
+        "last_scan_info": getattr(w, "last_scan_info", "") or "",
     }
 
 
@@ -9462,10 +9612,23 @@ async def list_watches(platform: str | None = None):
         if platform:
             q = q.where(CommentWatch.platform == platform)
         watches = s.exec(q).all()
-        counts = dict(s.exec(select(CommentRecord.watch_id, func.count(CommentRecord.id))
-                             .where(CommentRecord.watch_id.in_([w.id for w in watches]))
-                             .group_by(CommentRecord.watch_id)).all()) if watches else {}
-        return [dict(_watch_dict(w), comment_count=counts.get(w.id, 0)) for w in watches]
+        ids = [w.id for w in watches]
+        # 总数与「没推出去的条数」一次查完：这个列表每个监控位都渲染，
+        # 多一条 SQL 就是多一次往返（有回归测试专门盯着这里的查询数）。
+        stats = {
+            row[0]: (int(row[1] or 0), int(row[2] or 0))
+            for row in (s.exec(
+                select(CommentRecord.watch_id,
+                       func.count(CommentRecord.id),
+                       func.sum(case((CommentRecord.pushed_at.is_(None), 1),
+                                     else_=0)))
+                .where(CommentRecord.watch_id.in_(ids))
+                .group_by(CommentRecord.watch_id)).all() if watches else [])
+        }
+        return [dict(_watch_dict(w),
+                     comment_count=stats.get(w.id, (0, 0))[0],
+                     # 客户一眼看出「本地有记录、云端却没线索」的差额。
+                     unpushed_count=stats.get(w.id, (0, 0))[1]) for w in watches]
 
 
 @app.get("/api/quality-works")
@@ -9743,6 +9906,24 @@ async def scan_watch_now(wid: int):
     return await engine.scan_comment_watch(wid)
 
 
+class RepushUnpushedIn(BaseModel):
+    watch_id: int | None = None      # 只补某个监控位；留空补全部
+    limit: int = 500
+
+
+@app.post("/api/comment-watches/repush-unpushed")
+async def repush_unpushed_comment_leads(body: RepushUnpushedIn):
+    """把本地已入库但从没推出去的评论补推给 gdb15 一次。
+
+    修好推送判据之前的漏网线索不会自己回来：评论已入库，之后每一轮都按
+    comment_id 当成老评论跳过。gdb15 按 commentId 幂等，补推只会刷新线索。
+    """
+    if not engine:
+        raise HTTPException(503, "引擎未就绪")
+    return await engine.repush_unpushed_leads(
+        watch_id=body.watch_id, limit=max(1, min(int(body.limit or 500), 5000)))
+
+
 # ─────────── 评论 / 弹幕记录来源 ───────────
 def _watch_source(watch_id: int | None, platform: str, model, watch=None) -> dict:
     label = "评论" if model is CommentWatch else "弹幕"
@@ -9808,6 +9989,35 @@ def _watch_records(session, rows, model):
 
 
 # ─────────── 评论数据 ───────────
+def _intent_thresholds() -> tuple[int, int]:
+    """当前生效的高意向 / 待人工阈值（AI 未启用时用默认值，保证筛选可用）。"""
+    ai_cfg = intent_ai.config()
+    if ai_cfg is None:
+        return intent_ai.DEFAULT_HIGH, intent_ai.DEFAULT_REVIEW
+    high = max(1, int(ai_cfg.high or intent_ai.DEFAULT_HIGH))
+    return high, max(0, min(int(ai_cfg.review or 0), high))
+
+
+def _annotate_intent_tier(items: list[dict], high: int) -> list[dict]:
+    """把分层结论给前端当徽章用，省得 JS 再猜阈值。"""
+    if not items:
+        return items
+    for rec in items:
+        try:
+            score = int(rec.get("intent_score") if rec.get("intent_score")
+                        is not None else -1)
+        except (TypeError, ValueError):
+            score = -1
+        source = str(rec.get("intent_source") or "")
+        if source == "keyword" or score >= high:
+            rec["intent_tier"] = intent_ai.TIER_LEAD
+        elif source in ("ai", "none"):
+            rec["intent_tier"] = intent_ai.TIER_REVIEW
+        else:
+            rec["intent_tier"] = ""
+    return items
+
+
 def _comment_dict(c: CommentRecord, watch_source: dict | None = None) -> dict:
     return {
         "id": c.id, "watch_id": c.watch_id, "aweme_id": c.aweme_id,
@@ -9816,6 +10026,8 @@ def _comment_dict(c: CommentRecord, watch_source: dict | None = None) -> dict:
         "like_count": c.like_count, "create_time": c.create_time,
         "is_reply": bool(c.reply_to),
         "platform": c.platform, "captured_at": _watch_captured_at(c.created_at),
+        "intent_score": c.intent_score, "intent_label": c.intent_label,
+        "intent_reason": c.intent_reason, "intent_source": c.intent_source,
         "watch_source": watch_source or _watch_source(c.watch_id, c.platform, CommentWatch),
     }
 
@@ -9826,6 +10038,7 @@ async def list_comments(limit: int = 100, watch_id: int | None = None,
                         group_name: str = "", tag: str = "", q: str = "",
                         ip_label: str = "",
                         reply_type: str = "", min_like_count: int = 0,
+                        intent_tier: str = "",
                         sort: str = "latest", page: int = 1,
                         page_size: int = 10, paginate: bool = False,
                         captured_from: datetime | None = None,
@@ -9835,6 +10048,8 @@ async def list_comments(limit: int = 100, watch_id: int | None = None,
     page = max(1, page)
     page_size = max(1, min(page_size, 200))
     start, end = _content_capture_bounds(captured_from, captured_before)
+    # 阈值要在开session前读：intent_ai.config() 自己会开一个短会话查设置。
+    intent_high, _intent_review = _intent_thresholds()
     with get_session() as s:
         selected_source = _selected_watch_source(s, CommentWatch, watch_id, platform)
         stmt = _watch_record_filter(select(CommentRecord), CommentRecord, watch_id)
@@ -9859,6 +10074,15 @@ async def list_comments(limit: int = 100, watch_id: int | None = None,
             stmt = stmt.where(CommentRecord.reply_to != "")
         if min_like_count > 0:
             stmt = stmt.where(CommentRecord.like_count >= min_like_count)
+        # 意向分层：lead=高意向（AI 达标或命中意向词），review=灰区待人工。
+        if intent_tier in ("lead", "review"):
+            high = intent_high
+            if intent_tier == "lead":
+                stmt = stmt.where(or_(CommentRecord.intent_score >= high,
+                                      CommentRecord.intent_source == "keyword"))
+            else:
+                stmt = stmt.where(CommentRecord.intent_score < high,
+                                  CommentRecord.intent_source.in_(("ai", "none")))
         group_name, tag = _meta_text(group_name, 40), _meta_text(tag, 24)
         if group_name or tag:
             watch_query = select(CommentWatch)
@@ -9877,7 +10101,8 @@ async def list_comments(limit: int = 100, watch_id: int | None = None,
         ordering = _watch_record_ordering(CommentRecord, sort)
         if not paginate:
             rows = s.exec(stmt.order_by(*ordering).limit(limit)).all()
-            return _watch_records(s, rows, CommentWatch)
+            return _annotate_intent_tier(_watch_records(s, rows, CommentWatch),
+                                         intent_high)
 
         total = int(s.exec(select(func.count()).select_from(stmt.subquery())).one())
         pages = max(1, (total + page_size - 1) // page_size)
@@ -9885,7 +10110,9 @@ async def list_comments(limit: int = 100, watch_id: int | None = None,
                       .offset((page - 1) * page_size)
                       .limit(page_size)).all()
         return {
-            "items": _watch_records(s, rows, CommentWatch), "watch_source": selected_source,
+            "items": _annotate_intent_tier(
+                _watch_records(s, rows, CommentWatch), intent_high),
+            "watch_source": selected_source,
             "total": total, "page": page, "page_size": page_size,
             "pages": pages, "has_prev": page > 1, "has_next": page < pages,
         }

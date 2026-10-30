@@ -34,6 +34,7 @@ from . import compose
 from ..config import Config
 from ..account_lifecycle import AccountUnavailableError
 from ..db import get_session
+from .. import intent_ai
 from ..lead_push import push_comment_leads
 from ..platforms.douyin import (parse_aweme, parse_comment, parse_creator_comment,
                        parse_danmaku,
@@ -76,6 +77,9 @@ from .dm_automation import XhsDmAutomation
 from .cadence import bounded_ratio, periodic_deadline, row_deadline
 
 MAX_AUTO_RETRY = 3
+# 评论监控拉取的时间窗上限(秒)。监控位没设「评论有效期」时用它兜底：
+# 监控要的是新评论,没必要每轮把一条老视频的历史评论从头翻到尾。
+DEFAULT_COMMENT_WINDOW_SECONDS = 6 * 3600
 _WRITE_SUBMIT_PREFIX = "write_submitted:"
 
 log = logging.getLogger("creatorhub.engine")
@@ -249,10 +253,14 @@ def _douyin_scan_since(monitor_since: int, known_create_times: list[int]) -> int
 
 def _round_robin_by_account(rows: list[tuple[int, int | None]]) \
         -> list[tuple[int, int | None]]:
-    """Interleave due rows so one account cannot monopolize a scheduler burst."""
+    """Interleave due rows so one account cannot monopolize a scheduler burst.
+
+    匿名任务共用一个桶：如果每条匿名任务各自成桶，轮转就退化成
+    「所有匿名任务先跑完，再轮到账号」，账号之间照样会连着一口气扫完。
+    """
     buckets: dict[object, list[tuple[int, int | None]]] = {}
     for row_id, account_id in rows:
-        key: object = account_id if account_id is not None else f"anon:{row_id}"
+        key: object = account_id if account_id is not None else "anon"
         buckets.setdefault(key, []).append((row_id, account_id))
     ordered: list[tuple[int, int | None]] = []
     while buckets:
@@ -282,6 +290,9 @@ class MonitorEngine:
         # 同一时刻最多并发活跃的账号数(错峰,降低"多号同时活跃"特征)
         self._active_sem = asyncio.Semaphore(max(1, cfg.engine.active_accounts))
         self._inflight: set = set()           # 正在抓取的目标,避免同目标并发
+        # 本轮抓取计数(监控位 id -> 统计)，扫描结束时落成 last_scan_info，
+        # 让「记录是 0」也能说清是没抓到、还是抓到了被筛掉。
+        self._scan_stats: dict[int, dict] = {}
         self._publish_sem = asyncio.Semaphore(1)   # 发布串行(有头浏览器,一次一个)
         self._publishing: set[int] = set()
         self._commenting: set[int] = set()         # 正在执行的评论任务 id
@@ -2726,8 +2737,12 @@ class MonitorEngine:
             ws = s.exec(select(CommentWatch).where(CommentWatch.enabled == True)).all()  # noqa: E712
             for w in ws:
                 if self._periodic_due(w, "comment_watch"):
-                    due.append(w.id)
-        for wid in due:
+                    due.append((w.id, w.account_id))
+        # 按账号轮转：一个号不能独占一整轮扫描。
+        # 客户有多个号时，作品本来就分在各号上（见 intake 的分片逻辑），
+        # 扫描顺序再按号交错，平台看到的就不是「某个号在同一时刻把一批作品
+        # 全扫了一遍」这种明显的同步行为。
+        for wid, _ in _round_robin_by_account(due):
             await self.scan_comment_watch(wid)
 
     async def sync_work_comments(self, account_id: int, platform: str, item_id: str,
@@ -2976,6 +2991,7 @@ class MonitorEngine:
                 lambda: self._scan_comment_watch_locked(watch_id))
         finally:
             self._inflight.discard(key)
+            self._scan_stats.pop(int(watch_id), None)
 
     async def _scan_comment_watch_locked(self, watch_id: int) -> dict:
         with get_session() as s:
@@ -3074,7 +3090,14 @@ class MonitorEngine:
             w = s.get(CommentWatch, watch_id)
             if w:
                 w.last_scan_at = datetime.utcnow()
-                w.last_error = str(error or "")
+                stats = self._take_scan_stats(watch_id)
+                # 一条都没抓到且抓取环节给了原因，才把它算作错误；
+                # 「抓到了但都被筛掉」是正常结果，写在 last_scan_info 里。
+                fetch_note = ""
+                if not stats.get("fetched") and stats.get("notes"):
+                    fetch_note = stats["notes"][0]
+                w.last_error = str(error or fetch_note or "")
+                w.last_scan_info = self._format_scan_info(stats)[:300]
                 if author:
                     if not w.title:
                         w.title = author.get("nickname") or w.title
@@ -3088,23 +3111,41 @@ class MonitorEngine:
 
     async def _ingest(self, watch_id, aweme_id, fresh, name, work_desc, first_scan,
                       platform="douyin") -> int:
-        """fresh: parse_comment 结果(无 aweme_id)。入库 + 按时间水位线推送。"""
+        """fresh: parse_comment 结果(无 aweme_id)。入库 + 推送本轮真正新增的评论。
+
+        去重只认 comment_id，不再看时间水位线。以前额外要求
+        「评论时间戳比历史最大时间戳更新」才推送，而抖音的评论并不是按时间顺序
+        返回的：热度排序、翻页错位、子评论往往比父评论晚一轮抓到。于是「比水位线
+        旧的新评论」被判成已经推过 —— 本地留了记录、监控位上写着「高意向 N 条」，
+        gdb15 却一条都没收到，而且因为它已入库，之后永远不会补推。
+        生产实测丢过：2026-10-30 评论监控 6，本地报 1 条高意向，云端 0 条。
+        """
         if not fresh:
-            return 0
-        settings = self._comment_watch_settings(watch_id)
-        matched = [c for c in fresh if self._comment_watch_matches(c, settings)]
-        if not matched:
             return 0
         key = str(aweme_id or "")
         with get_session() as s:
-            watch = s.get(CommentWatch, watch_id)
-            marks = _load_comment_watermark(watch)
-            times = s.exec(select(CommentRecord.create_time)
-                           .where(CommentRecord.watch_id == watch_id)
-                           .where(CommentRecord.aweme_id == aweme_id)).all()
-            # 老部署没有水位线，先用已入库评论兜底，避免升级后一次性重推。
-            prev_max = max([int(marks.get(key, 0))]
-                            + [int(t) for t in times if t] + [0])
+            known = set(s.exec(select(CommentRecord.comment_id)
+                               .where(CommentRecord.watch_id == watch_id)
+                               .where(CommentRecord.aweme_id == aweme_id)).all())
+        # 抓取端本来就按 comment_id 排除已入库评论，这里再兜一道：
+        # 任何一个调用方漏过滤，都不会变成重复线索。
+        seen: set = set()
+        candidates = []
+        for c in fresh:
+            cid = str(c.get("comment_id") or "")
+            if not cid or cid in known or cid in seen:
+                continue
+            seen.add(cid)
+            candidates.append(c)
+        if not candidates:
+            return 0
+        settings = self._comment_watch_settings(watch_id)
+        screened = [c for c in candidates if self._comment_watch_hard_match(c, settings)]
+        matched, pushable = await self._screen_intent(watch_id, screened, settings)
+        self._note_scan_stat(watch_id, fetched=len(candidates), screened=len(screened),
+                             leads=len(matched))
+        if not matched:
+            return 0
         stored = matched
         lead_limit = getattr(self.cfg.plan, "monthly_lead_records", None)
         if lead_limit is not None:
@@ -3118,13 +3159,31 @@ class MonitorEngine:
                 stored = [c for c in matched if id(c) in allowed]
         # 只推送真正入库的评论，否则月额度只能限制入库、限制不住推送，
         # 客户可以在 gdb15 里收到远超套餐数量的线索。
-        newer = [c for c in stored if int(c.get("create_time") or 0) > prev_max]
+        # 灰区（待人工）默认只入库不推送：AI 先分档，人在 CreatorHub 里看；
+        # 想让灰区也自动进 gdb15，就打开「灰区也推送」开关。
+        # stored 里的对象与 matched/pushable 是同一批 dict，用 id 对齐即可。
+        if len(pushable) != len(stored):
+            push_ids = {id(c) for c in pushable}
+            push_pool = [c for c in stored if id(c) in push_ids]
+        else:
+            push_pool = stored
+        if first_scan:
+            # 首次扫描也推（以前整轮丢弃，等于新监控位第一批线索白白扔掉），
+            # 但必须落在评论有效期内：有效期没设时用默认窗口兜底，
+            # 免得给一条老视频建监控，就把历史评论一次性灌进客户的付费线索池。
+            window = (int(settings.get("comment_max_age_minutes") or 0) * 60
+                      or DEFAULT_COMMENT_WINDOW_SECONDS)
+            cutoff = int(time.time()) - window
+            push_pool = [c for c in push_pool
+                         if int(c.get("create_time") or 0) >= cutoff]
         with get_session() as s:
             watch = s.get(CommentWatch, watch_id)
             for c in stored:
                 s.add(CommentRecord(platform=platform, watch_id=watch_id,
                                     aweme_id=aweme_id, **c))
             if watch:
+                # 水位线继续记：它不再是推送闸门，只是「扫到哪儿了」的基线，
+                # 留着便于排查和回滚，也供后续回填功能使用。
                 marks = _load_comment_watermark(watch)
                 if key:
                     marks[key] = max(
@@ -3133,9 +3192,11 @@ class MonitorEngine:
                     watch.comment_watermark = json.dumps(marks, ensure_ascii=False)
                 s.add(watch)
             s.commit()
-        if not first_scan and newer:
-            await self._notify_comments(name, work_desc, newer)
-            await self._push_comment_leads(platform, aweme_id, newer, settings)
+        if push_pool:
+            if not first_scan:
+                # 首轮是一次性回填，弹窗提示会变成刷屏；线索照常推 gdb15。
+                await self._notify_comments(name, work_desc, push_pool)
+            await self._push_comment_leads(platform, aweme_id, push_pool, settings)
         return len(stored)
 
     async def _push_comment_leads(self, platform: str, aweme_id: str,
@@ -3148,8 +3209,114 @@ class MonitorEngine:
             if result.get("errors"):
                 log.warning("gdb15 线索推送失败 %s/%s: %s",
                             platform, aweme_id, "; ".join(result["errors"]))
+            # 送达回执：已送进 gdb15 的、以及已进暂存箱等着补推的，都算责任被接管。
+            # 剩下的空值就是「一条都没出去过」，补推工具只挑这些。
+            self._mark_comments_pushed(aweme_id, result.get("handled") or [])
+            return result
         except Exception as exc:
             log.warning("gdb15 线索推送异常 %s/%s: %r", platform, aweme_id, exc)
+            return {"errors": [repr(exc)], "handled": []}
+
+    def _mark_comments_pushed(self, aweme_id: str, comment_ids: list) -> int:
+        """给已入库的评论盖上送达回执。"""
+        ids = [str(c or "").strip() for c in (comment_ids or []) if str(c or "").strip()]
+        if not ids or not aweme_id:
+            return 0
+        stamp = datetime.utcnow()
+        with get_session() as s:
+            rows = s.exec(select(CommentRecord).where(
+                CommentRecord.aweme_id == str(aweme_id),
+                CommentRecord.comment_id.in_(ids),
+                CommentRecord.pushed_at.is_(None))).all()
+            for row in rows:
+                row.pushed_at = stamp
+                s.add(row)
+            s.commit()
+            return len(rows)
+
+    def _record_comment_dict(self, rec: CommentRecord) -> dict:
+        """把已入库的评论还原成抓取时的形状，供补推复用同一条推送出口。"""
+        return {
+            "comment_id": rec.comment_id, "text": rec.text,
+            "user_nickname": rec.user_nickname, "user_sec_uid": rec.user_sec_uid,
+            "ip_label": rec.ip_label, "like_count": rec.like_count,
+            "create_time": rec.create_time, "reply_to": rec.reply_to,
+            "intent_score": rec.intent_score, "intent_label": rec.intent_label,
+            "intent_reason": rec.intent_reason, "intent_source": rec.intent_source,
+        }
+
+    def _repush_pushable(self, rec: CommentRecord, settings: dict,
+                         ai_cfg) -> bool:
+        """按现在的口径判断一条已入库评论该不该推给 gdb15。
+
+        不重新调模型：判定结果当场已经写进 intent_score / intent_source，
+        补推时再判一次只会更贵，还更容易因为模型抖动改口。
+        """
+        item = self._record_comment_dict(rec)
+        hits = self._matched_intent_terms(item, settings)
+        if ai_cfg is None:
+            # 与 _comment_watch_matches 完全同一口径，别在这里另立一套。
+            return bool(hits) or self._intent_terms_hit(item, settings)
+        try:
+            score = int(rec.intent_score if rec.intent_score is not None else -1)
+        except (TypeError, ValueError):
+            score = -1
+        if hits or score >= int(ai_cfg.high):
+            return True
+        return bool(ai_cfg.push_review and score >= int(ai_cfg.review))
+
+    async def repush_unpushed_leads(self, watch_id: int | None = None,
+                                    limit: int = 500) -> dict:
+        """把「已入库却一条都没推出去」的评论补推给 gdb15 一次。
+
+        为什么需要这个出口：推送闸门修好之前攒下的漏网线索不会自己回来 ——
+        它们已经入库，之后每一轮都按 comment_id 被当成老评论跳过。
+        这是客户主动点的一次性动作，所以不按有效期拦（拦了就把要补的东西
+        全拦掉了），但仍按地区与排除词复核，并沿用当前的高意向口径。
+        gdb15 按 commentId 幂等，重复推只会刷新已有线索，不会多出重复。
+        """
+        ai_cfg = intent_ai.config()
+        with get_session() as s:
+            q = select(CommentRecord).where(CommentRecord.pushed_at.is_(None))
+            if watch_id:
+                q = q.where(CommentRecord.watch_id == int(watch_id))
+            rows = list(s.exec(q.order_by(CommentRecord.create_time.desc())
+                               .limit(max(1, int(limit)))).all())
+            for r in rows:
+                s.expunge(r)
+        cache: dict = {}
+        groups: dict = {}
+        skipped = 0
+        for rec in rows:
+            wid = int(rec.watch_id or 0)
+            if wid not in cache:
+                cache[wid] = self._comment_watch_settings(wid) if wid else {}
+            settings = cache[wid]
+            item = self._record_comment_dict(rec)
+            if not settings or not self._comment_watch_hard_match(
+                    item, settings, ignore_age=True) \
+                    or not self._repush_pushable(rec, settings, ai_cfg):
+                skipped += 1
+                continue
+            groups.setdefault((rec.platform, rec.aweme_id),
+                              []).append((item, settings))
+        pushed = 0
+        items = []
+        for (platform, aweme_id), batch in groups.items():
+            settings = batch[0][1]
+            result = await self._push_comment_leads(
+                platform, aweme_id, [b[0] for b in batch], settings)
+            handed = len((result or {}).get("handled") or [])
+            pushed += handed
+            items.append({"platform": platform, "aweme_id": aweme_id,
+                          "queued": handed, "errors": (result or {}).get("errors") or []})
+        with get_session() as s:
+            q = select(CommentRecord.id).where(CommentRecord.pushed_at.is_(None))
+            if watch_id:
+                q = q.where(CommentRecord.watch_id == int(watch_id))
+            remaining = len(s.exec(q).all())
+        return {"checked": len(rows), "pushed": pushed, "skipped": skipped,
+                "remaining_unpushed": remaining, "items": items[:20]}
 
     def _comment_watch_settings(self, watch_id: int) -> dict:
         cfg = self.cfg.engine
@@ -3175,11 +3342,133 @@ class MonitorEngine:
                     getattr(watch, "exclude_keywords", "[]") or "[]"),
             }
 
-    def _comment_watch_matches(self, comment: dict, settings: dict) -> bool:
-        """Apply lead filters before a captured comment is persisted."""
+    def _note_scan_stat(self, watch_id: int, *, fetched: int = 0, screened: int = 0,
+                        leads: int = 0, review: int = 0, note: str = "") -> None:
+        """累加本轮抓取计数。
+
+        同一监控位靠 _inflight 互斥、事件循环又是单线程，按 id 累加是安全的。
+        """
+        # 懒建：部分单测用 __new__ 造引擎，没有走过 __init__。
+        if not hasattr(self, "_scan_stats"):
+            self._scan_stats = {}
+        bucket = self._scan_stats.setdefault(int(watch_id), {
+            "fetched": 0, "screened": 0, "leads": 0, "review": 0, "notes": []})
+        bucket["fetched"] += int(fetched or 0)
+        bucket["screened"] += int(screened or 0)
+        bucket["leads"] += int(leads or 0)
+        bucket["review"] += int(review or 0)
+        text = str(note or "").strip()[:200]
+        if text and text not in bucket["notes"]:
+            bucket["notes"].append(text)
+
+    def _take_scan_stats(self, watch_id: int) -> dict:
+        return (getattr(self, "_scan_stats", {}) or {}).pop(int(watch_id), None) or {}
+
+    @staticmethod
+    def _format_scan_info(stats: dict) -> str:
+        """把本轮计数写成人话，界面上直接看得懂「为什么是 0」。"""
+        if not stats:
+            return ""
+        notes = list(stats.get("notes") or [])
+        fetched = int(stats.get("fetched") or 0)
+        if not fetched:
+            return "；".join(notes) or "本轮没有新评论"
+        leads = int(stats.get("leads") or 0)
+        review = int(stats.get("review") or 0)
+        info = (f"抓到 {fetched} 条新评论，"
+                f"过时间/地区 {int(stats.get('screened') or 0)} 条，"
+                f"高意向 {max(0, leads - review)} 条")
+        if review:
+            info += f"，待人工 {review} 条"
+        return info + ("；" + "；".join(notes) if notes else "")
+
+    async def _screen_intent(self, watch_id: int, screened: list[dict],
+        settings: dict) -> tuple[list[dict], list[dict]]:
+        """判定哪些评论算线索。
+
+        未启用 AI 时沿用意向词硬筛，升级前后行为一致；启用后意向词降级为
+        加分信号，由大模型把「说法不同、没撞上词」的客户捞回来，灰区留人工。
+
+        返回 (入库列表, 推送列表)：AI 关闭时两者相同；AI 开启时灰区默认只入库，
+        除非配置里打开 push_review（灰区也推送）。
+        """
+        terms = settings.get("intent_keywords") or []
+        if not screened:
+            return [], []
+        # screened 已过硬条件，这里等价于只看意向词，复用同一个关键词口径。
+        keep_by_keyword = [c for c in screened
+                           if self._comment_watch_matches(c, settings)]
+        ai_cfg = intent_ai.config()
+        if ai_cfg is None:
+            for c in keep_by_keyword:
+                if terms:
+                    c["intent_source"] = "keyword"
+            return keep_by_keyword, keep_by_keyword
+        try:
+            verdicts = await intent_ai.score(screened, ai_cfg)
+        except intent_ai.IntentAIError as exc:
+            # 模型挂了绝不能等于「没有线索」：回退意向词，并把原因写到监控位。
+            log.warning("AI 意向判定失败(监控 %s)，本轮回退意向词: %s", watch_id, exc)
+            self._note_scan_stat(
+                watch_id, note=f"AI 意向判定失败，本轮回退意向词：{exc}")
+            return keep_by_keyword, keep_by_keyword
+        kept: list[dict] = []
+        pushable: list[dict] = []
+        review = 0
+        for comment, verdict in zip(screened, verdicts):
+            call = intent_ai.decide(comment, verdict, ai_cfg, terms)
+            if call["tier"] == intent_ai.TIER_DROP:
+                continue
+            if call["tier"] == intent_ai.TIER_REVIEW:
+                review += 1
+            comment["intent_score"] = call["score"] if call["scored"] else -1
+            comment["intent_label"] = call["label"]
+            comment["intent_reason"] = call["reason"]
+            comment["intent_source"] = ("keyword" if call["matched"]
+                                        else "ai" if call["scored"] else "none")
+            kept.append(comment)
+            if call["tier"] == intent_ai.TIER_LEAD:
+                pushable.append(comment)
+        if review and ai_cfg.push_review:
+            pushable = list(kept)
+        self._note_scan_stat(watch_id, review=review)
+        return kept, pushable
+
+    def _comment_watch_matches(self, comment: dict, settings: dict,
+                               ignore_age: bool = False) -> bool:
+        """整条口径：硬条件 + 意向词（AI 未启用时的判定入口）。"""
+        if not self._comment_watch_hard_match(comment, settings,
+                                              ignore_age=ignore_age):
+            return False
+        return self._intent_terms_hit(comment, settings)
+
+    def _intent_terms_hit(self, comment: dict, settings: dict) -> bool:
+        """意向词这一关。没配意向词时算通过（保持历史口径，别改）。"""
+        intents = settings.get("intent_keywords") or []
+        if not intents:
+            return True
+        text = str(comment.get("text") or "").casefold()
+        return any(str(term).casefold() in text for term in intents)
+
+    def _matched_intent_terms(self, comment: dict, settings: dict) -> list:
+        """真正撞上的意向词。空列表就是没撞上，与「没配词」是两回事。"""
+        text = str((comment or {}).get("text") or "").casefold()
+        return [str(term) for term in (settings.get("intent_keywords") or [])
+                if str(term).strip() and str(term).casefold() in text]
+
+    def _comment_watch_hard_match(self, comment: dict, settings: dict,
+                                  ignore_age: bool = False) -> bool:
+        """时间窗 / 地区 / 排除词：三条硬条件，AI 也不能放行。
+
+        意向词不在这里判定——AI 开启时它退成加分信号（见 _screen_intent），
+        否则「说法不同但明显是买家」的评论会被硬筛掉。
+
+        ignore_age 只给「补推」用：客户主动要求把以前漏掉的线索再推一次时，
+        不该被有效期挡在外面。
+        """
         max_age = int(settings.get("comment_max_age_minutes") or 0)
         create_time = int(comment.get("create_time") or 0)
-        if max_age:
+        if max_age and not ignore_age:
             if not create_time:
                 return False
             if max(0, int(time.time())) - create_time > max_age * 60:
@@ -3194,9 +3483,6 @@ class MonitorEngine:
         excludes = settings.get("exclude_keywords") or []
         if excludes and any(str(term).casefold() in text for term in excludes):
             return False
-        intents = settings.get("intent_keywords") or []
-        if intents and not any(str(term).casefold() in text for term in intents):
-            return False
         return True
 
     async def _cw_video(self, watch_id, identity, aweme_id, name, first_scan,
@@ -3210,8 +3496,17 @@ class MonitorEngine:
         raw, err = [], ""
         if api_client is not None and cfg.douyin_read_mode in {"api", "hybrid"}:
             try:
+                # 监控只关心「刚出现的新评论」,不把这条视频的历史评论全搬一遍。
+                # 时间窗取监控位自己设的评论有效期;没设(0=不限)时用默认窗口,
+                # 免得一条老视频每轮都从头翻到尾。
+                window_seconds = (int(settings.get("comment_max_age_minutes") or 0)
+                                 * 60) or DEFAULT_COMMENT_WINDOW_SECONDS
                 async with api_client.session_scope():
-                    raw = await api_client.fetch_all_comments(aweme_id)
+                    raw = await api_client.fetch_recent_comments(
+                        aweme_id,
+                        max_pages=cfg.comment_watch_max_pages,
+                        max_age_seconds=window_seconds,
+                        max_reply_pages=cfg.comment_watch_max_reply_pages)
                 fresh = [c for c in (parse_comment(rc) for rc in raw)
                          if c and c["comment_id"] not in known]
                 # 非空响应即使全部是已知评论也代表 API 成功，不应重复打开浏览器。
@@ -3236,7 +3531,10 @@ class MonitorEngine:
             block_media=cfg.block_media_resources)
         err = browser_err or err
         if err:
-            log.info("评论监控(视频)%s: %s", aweme_id, err)
+            # 抓取环节的原因必须传到监控位上：以前只 log.info（默认没有
+            # handler，等于丢掉），界面只剩一个没有解释的 0。
+            self._note_scan_stat(watch_id, note=err)
+            log.warning("评论监控(视频)%s: %s", aweme_id, err)
         fresh = [c for c in (parse_comment(rc) for rc in raw) if c]
         n = await self._ingest(watch_id, aweme_id, fresh, name,
                                work_desc or name, first_scan)

@@ -20,6 +20,12 @@ class EngineConfig:
     comment_recent_works: int = 5      # 监控评论时,只看每个目标最近 N 条作品
     comment_recent_days: int = 7       # 且仅限最近多少天内发布的作品
     comment_max_scrolls: int = 6       # 评论区翻页深度(滚动容器次数,越大扫得越深)
+    # 评论监控单轮拉取深度(API 通道)。
+    # 监控位上到几百条时,全量拉评论(30 页 + 每条评论的回复)一轮就是上百次
+    # 请求,风控暴露面和代理消耗都是数量级的浪费。这里按「够用就停」:
+    # 翻够页数就停,时间窗之外的评论不拉回复。
+    comment_watch_max_pages: int = 4
+    comment_watch_max_reply_pages: int = 1
     danmaku_recent_works: int = 5      # 弹幕监控账号模式默认扫描的近期作品数
     danmaku_recent_days: int = 7       # 弹幕监控账号模式默认作品时间范围
     danmaku_max_scrolls: int = 6       # 弹幕抓取默认翻页/加载轮次
@@ -142,7 +148,13 @@ class RiskControlConfig:
     mode: str = "conservative"
     network_group_concurrency: int = 1
     read_light_gap_seconds: int = 20
-    read_heavy_gap_seconds: int = 60
+    # 同一账号两次「重读」(评论监控 / 主页扫描)之间的最小间隔。
+    # 这是上限不是节奏:监控位少的时候,真正的节奏由每条监控自己的检查间隔
+    # 决定(见 plan.min_monitor_interval_seconds),这个值只在监控位多到
+    # 「一个号的请求排不过来」时才成为瓶颈。
+    # 60 秒会让 100 条 / 1 个号的客户实际两小时才轮完一遍;
+    # 25 秒(2.4 次/分钟)既能跟上大套餐,又比人工刷评论慢得多。
+    read_heavy_gap_seconds: int = 25
     shared_write_gap_seconds: int = 300
     comment_min_gap_seconds: int = 600
     comment_hourly_cap: int = 3
@@ -250,6 +262,10 @@ def load_config(path: str | None = None) -> Config:
             setattr(cfg.engine, name, min(1.0, max(0.0, value)) if math.isfinite(value) else 0.0)
         cfg.engine.initial_scan_spread_seconds = max(
             0, min(600, int(cfg.engine.initial_scan_spread_seconds)))
+        cfg.engine.comment_watch_max_pages = max(
+            1, min(30, int(cfg.engine.comment_watch_max_pages)))
+        cfg.engine.comment_watch_max_reply_pages = max(
+            0, min(12, int(cfg.engine.comment_watch_max_reply_pages)))
         cfg.engine.browser_session_idle_seconds = max(
             0, int(cfg.engine.browser_session_idle_seconds))
         if cfg.engine.xhs_cdp_idle_seconds is not None:

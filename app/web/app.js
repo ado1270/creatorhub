@@ -2244,7 +2244,7 @@ function showWatchRecords(kind, id) {
   const view = watchRecordConfig(kind);
   if (kind === "comment") { COMMENT_SRC = value; COMMENT_GROUP = COMMENT_TAG = ""; selComment.clear(); }
   else DANMAKU_SRC = value;
-  for (const suffix of ["query", "group", "tag", "type", "min-likes", "time-start", "time-end", "captured-from", "captured-to"]) {
+  for (const suffix of ["query", "group", "tag", "type", "intent", "min-likes", "time-start", "time-end", "captured-from", "captured-to"]) {
     const node = $(kind + "-" + suffix); if (node) { node.value = ""; node._csSync?.(); }
   }
   if ($(kind + "-sort")) { $(kind + "-sort").value = "captured_desc"; $(kind + "-sort")._csSync?.(); }
@@ -2272,6 +2272,19 @@ function watchRecordTimeMarkup(kind, row) {
   const captured = row.captured_at !== undefined ? row.captured_at : row.created_at;
   return `<span class="content-origin-label">抓取入库</span>${contentCapturedTime(captured, kind === "danmaku")}
     <div class="content-published-time">${kind === "comment" ? "评论发布" : "弹幕发送"} · ${fmtTime(row.create_time)}</div>`;
+}
+// AI 意向徽章：分数/类别/依据都放在 title 里，列表一眼能扫。
+function intentBadgeMarkup(row) {
+  const tier = row.intent_tier || "", source = row.intent_source || "";
+  const score = Number(row.intent_score);
+  const judged = Number.isFinite(score) && score >= 0;
+  if (!tier && !judged && !source) return "";
+  const name = tier === "lead" ? "高意向" : tier === "review" ? "待人工" : "未判定";
+  const detail = [(judged ? `${score} 分` : ""), row.intent_label || "",
+                  row.intent_reason || ""].filter(Boolean).join(" · ");
+  return `<span class="pill intent-badge intent-tier-${esc(tier || "none")}"`
+    + (detail ? ` title="${esc(detail)}"` : "")
+    + `>${name}${judged ? " " + score : ""}</span>`;
 }
 function prepareWatchRecordLoad(kind, resetPage) {
   const view = watchRecordConfig(kind), scope = PLATFORM + ":" + view.src;
@@ -4456,6 +4469,7 @@ async function loadSettings() {
     }
   } catch (e) {}
   loadLicenseStatus();
+  loadIntakeList();
   loadLeadPushOutbox();
   loadSelfCheck();
   try {
@@ -4472,6 +4486,18 @@ async function loadSettings() {
       assign("ai-temp", "value", s.ai_temperature || "0.9");
       assign("ai-prompt", "value", s.ai_prompt || "");
       $("ai-key").placeholder = s.ai_api_key_set ? "已保存(留空=不修改)" : "API Key";
+    }
+    if ($("intent-ai-enabled")) {
+      assign("intent-ai-enabled", "checked", !!s.intent_ai_enabled);
+      assign("intent-ai-base", "value", s.intent_ai_base_url || "");
+      assign("intent-ai-model", "value", s.intent_ai_model || "");
+      assign("intent-ai-business", "value", s.intent_ai_business || "");
+      assign("intent-ai-high", "value", s.intent_ai_high || "70");
+      assign("intent-ai-review", "value", s.intent_ai_review || "40");
+      assign("intent-ai-batch", "value", s.intent_ai_batch || "12");
+      assign("intent-ai-timeout", "value", s.intent_ai_timeout || "60");
+      assign("intent-ai-push-review", "checked", !!s.intent_ai_push_review);
+      $("intent-ai-key").placeholder = s.intent_ai_api_key_set ? "已保存(留空=不修改)" : "可留空(本地 Ollama)";
     }
     if ($("lead-push-enabled")) {
       assign("lead-push-enabled", "checked", !!s.lead_push_enabled);
@@ -4791,6 +4817,75 @@ async function refreshLicense() {
     }
   });
 }
+// ─── 手机采集入口 ───
+const INTAKE_STATUS_TEXT = {
+  pending: "等待接收", claimed: "正在添加", done: "已加入监控",
+  failed: "添加失败", rejected: "已拒绝",
+};
+const INTAKE_PLATFORM_TEXT = { douyin: "抖音", xhs: "小红书", kuaishou: "快手" };
+
+async function loadIntakeList() {
+  const box = $("intake-list");
+  if (!box) return;
+  try {
+    const st = await api("/api/intake/status");
+    if (!st.enabled) {
+      box.innerHTML = `<p class="mut">手机入口未启用：先在上方填好 gdb15 授权地址和 API Key。</p>`;
+      return;
+    }
+    const items = st.recent || [];
+    if (!items.length) {
+      box.innerHTML = `<p class="mut">还没有从手机提交过作品。</p>`;
+      return;
+    }
+    box.innerHTML = `<div class="table-wrap"><table><thead><tr>`
+      + `<th>平台</th><th>作品</th><th>状态</th><th>提交时间</th></tr></thead><tbody>`
+      + items.map((it) => `<tr>
+          <td>${esc(INTAKE_PLATFORM_TEXT[it.platform] || it.platform)}</td>
+          <td><code>${esc(it.watchTitle || it.url || it.rawText || "")}</code></td>
+          <td>${esc(INTAKE_STATUS_TEXT[it.status] || it.status)}${
+            it.error ? `<div class="isolation-note">${esc(it.error)}</div>` : ""}</td>
+          <td>${esc(String(it.createdAt || "").replace("T", " ").slice(0, 16))}</td>
+        </tr>`).join("")
+      + `</tbody></table></div>`;
+  } catch (e) {
+    box.innerHTML = `<p class="mut">读取失败：${esc(e.message)}</p>`;
+  }
+}
+
+async function createIntakeLink() {
+  $("intake-msg").textContent = "生成中…";
+  await withBusy(evtBtn(), "生成中", async () => {
+    try {
+      const r = await api("/api/intake/mobile-link", { method: "POST" });
+      if (r.qrDataUri) $("intake-qr").src = r.qrDataUri;
+      $("intake-url").value = r.url || "";
+      $("intake-qr-wrap").style.display = "flex";
+      $("intake-msg").textContent = "已生成，手机扫码即可";
+      toast("手机入口已生成", "ok");
+    } catch (e) {
+      $("intake-msg").textContent = "生成失败: " + e.message;
+      toast("生成失败:" + e.message, "err");
+    }
+  });
+}
+
+async function refreshIntake() {
+  $("intake-msg").textContent = "接收中…";
+  await withBusy(evtBtn(), "接收中", async () => {
+    try {
+      const r = await api("/api/intake/refresh", { method: "POST" });
+      $("intake-msg").textContent = r.claimed
+        ? `接收 ${r.claimed} 条，成功 ${r.done} 条，失败 ${r.failed} 条`
+        : "没有待接收的作品";
+      toast(r.claimed ? `已接收 ${r.claimed} 条` : "没有待接收的作品", "ok");
+      await loadIntakeList();
+    } catch (e) {
+      $("intake-msg").textContent = "接收失败: " + e.message;
+      toast("接收失败:" + e.message, "err");
+    }
+  });
+}
 async function saveAiSettings() {
   if (!validateAiSettings(false)) return;
   $("ai-msg").textContent = "保存中…";
@@ -4827,6 +4922,66 @@ async function testAi() {
       if (r.ok) { $("ai-msg").innerHTML = `连通正常 ✓ 样例文案:<b>${esc(r.sample || "")}</b>`; toast("AI 连通正常 ✓", "ok", 6000); }
       else { $("ai-msg").textContent = "连通失败:" + (r.error || ""); toast("AI 连通失败:" + (r.error || ""), "err", 8000); }
     } catch (e) { $("ai-msg").textContent = "失败:" + e.message; toast("测试失败:" + e.message, "err"); }
+  });
+}
+
+function intentAiBody() {
+  const body = {
+    intent_ai_enabled: $("intent-ai-enabled").checked,
+    intent_ai_base_url: $("intent-ai-base").value.trim(),
+    intent_ai_model: $("intent-ai-model").value.trim(),
+    intent_ai_business: $("intent-ai-business").value.trim(),
+    intent_ai_high: $("intent-ai-high").value.trim(),
+    intent_ai_review: $("intent-ai-review").value.trim(),
+    intent_ai_batch: $("intent-ai-batch").value.trim(),
+    intent_ai_timeout: $("intent-ai-timeout").value.trim(),
+    intent_ai_push_review: $("intent-ai-push-review").checked,
+  };
+  const key = $("intent-ai-key").value.trim();
+  if (key) body.intent_ai_api_key = key;
+  return body;
+}
+async function saveIntentAiSettings() {
+  const high = +($("intent-ai-high").value || 70), review = +($("intent-ai-review").value || 40);
+  if (!(high >= 1 && high <= 100) || !(review >= 0 && review <= 100)) {
+    $("intent-ai-msg").textContent = "分数线须为 0~100"; return;
+  }
+  if (review > high) { $("intent-ai-msg").textContent = "待人工分数线不能高于高意向分数线"; return; }
+  if ($("intent-ai-enabled").checked && !($("intent-ai-base").value.trim() && $("intent-ai-model").value.trim())) {
+    $("intent-ai-msg").textContent = "启用前请填接口地址与模型"; return;
+  }
+  $("intent-ai-msg").textContent = "保存中…";
+  await withBusy(evtBtn(), "保存中", async () => {
+    try {
+      const s = await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(intentAiBody()) });
+      $("intent-ai-key").value = "";
+      $("intent-ai-key").placeholder = s.intent_ai_api_key_set ? "已保存(留空=不修改)" : "可留空(本地 Ollama)";
+      $("intent-ai-msg").textContent = "已保存 ✓ " + (s.intent_ai_enabled ? "AI 判定已生效" : "(当前按高意向词硬筛)");
+      toast("AI 意向设置已保存", "ok");
+    } catch (e) { $("intent-ai-msg").textContent = "失败: " + e.message; toast("保存失败:" + e.message, "err"); }
+  });
+}
+async function testIntentAi() {
+  if (!($("intent-ai-base").value.trim() && $("intent-ai-model").value.trim())) {
+    $("intent-ai-msg").textContent = "请先填接口地址与模型"; return;
+  }
+  const body = {
+    base_url: $("intent-ai-base").value.trim(), model: $("intent-ai-model").value.trim(),
+    business: $("intent-ai-business").value.trim(),
+    high: $("intent-ai-high").value.trim(), review: $("intent-ai-review").value.trim(),
+  };
+  const key = $("intent-ai-key").value.trim();
+  if (key) body.api_key = key;
+  const box = $("intent-ai-result");
+  $("intent-ai-msg").textContent = "判定中…";
+  await withBusy(evtBtn(), "判定中", async () => {
+    try {
+      const r = await api("/api/settings/intent-ai-test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      if (!r.ok) { $("intent-ai-msg").textContent = "失败:" + (r.error || ""); toast("AI 判定失败:" + (r.error || ""), "err", 8000); return; }
+      $("intent-ai-msg").textContent = `连通正常 ✓ ${r.model}（高意向≥${r.high}，待人工≥${r.review}）`;
+      box.hidden = false;
+      box.innerHTML = (r.items || []).map(it => `<div class="intent-ai-sample"><span class="intent-ai-tier-${esc(it.tier || "none")}">${esc(it.tier === "lead" ? "高意向" : it.tier === "review" ? "待人工" : "丢弃")}</span><b>${esc(it.text || "")}</b><span class="mut">${esc(String(it.score))} 分 ${esc(it.label || "")}${it.reason ? " · " + esc(it.reason) : ""}</span></div>`).join("");
+    } catch (e) { $("intent-ai-msg").textContent = "失败:" + e.message; toast("测试失败:" + e.message, "err"); }
   });
 }
 async function saveSettings() {
@@ -7395,7 +7550,7 @@ function watchRow(w) {
     <td class="num"><button type="button" class="ghost sm monitor-record-link" data-comment-records="${w.id}" onclick="showWatchRecords('comment',${w.id})">查看记录 <span>${fmtNum(w.comment_count || 0)}</span></button></td>
     <td class="num">${monitorIntervalText(w.interval_seconds)}
       ${w.kind === "user" && (w.recent_works || w.recent_days) ? `<div class="mut" style="font-size:11px">${w.recent_works ? `近 ${w.recent_works} 个` : "全局作品数"} · ${w.recent_days ? `${w.recent_days} 天` : "全局天数"}</div>` : ""}</td>
-    <td class="mut">${w.last_scan_at ? new Date(w.last_scan_at + "Z").toLocaleString() : "—"}${w.last_error ? ` <span class="warn-ic" title="${esc(w.last_error)}">${ic("i-info")}</span>` : ""}${autoRunHint(w.next_auto_run_at)}</td>
+    <td class="mut">${w.last_scan_at ? new Date(w.last_scan_at + "Z").toLocaleString() : "—"}${w.last_error ? ` <span class="warn-ic" title="${esc(w.last_error)}">${ic("i-info")}</span>` : ""}${autoRunHint(w.next_auto_run_at)}${w.last_scan_info ? `<div class="scan-info" title="${esc(w.last_scan_info)}">${esc(w.last_scan_info)}</div>` : ""}${w.unpushed_count > 0 ? `<div class="scan-info">未确认推送 ${fmtNum(w.unpushed_count)} 条 <button type="button" class="ghost sm" onclick="repushWatch(${w.id})" title="这些评论入库后没有推送回执。点补推会再推一次：gdb15 按评论 ID 去重，已经在线索库里的只会刷新，不会多出重复线索">补推</button></div>` : ""}</td>
     <td><span class="pill ${w.enabled ? "active" : "paused"}">${w.enabled ? "监控中" : "已暂停"}</span></td>
     <td class="acttd">
       <button class="ghost sm" onclick="scanWatch(${w.id})">立即抓取</button>
@@ -7592,6 +7747,16 @@ async function scanWatch(id) {
   });
   refreshWatches(); refreshComments();
 }
+async function repushWatch(id) {
+  try {
+    const r = await api("/api/comment-watches/repush-unpushed", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ watch_id: id }) });
+    toast(`补推完成：接管 ${r.pushed || 0} 条，按当前口径跳过 ${r.skipped || 0} 条`,
+      (r.pushed || 0) ? "ok" : "info");
+    refreshWatches();
+  } catch (e) { toast("补推失败:" + e.message, "err"); }
+}
 async function toggleWatch(id, on) { try { await api("/api/comment-watches/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: on }) }); refreshWatches(); } catch (e) { toast("操作失败:" + e.message, "err"); } }
 async function delWatch(id) {
   if (!await uiConfirm({ title: "删除评论监控", message: "仅删除该监控配置，已抓取的评论记录会保留，并标注原任务已删除。", okText: "删除", danger: true })) return;
@@ -7667,10 +7832,12 @@ async function refreshComments(resetPage = false) {
   const query = (($('comment-query') && $('comment-query').value) || "").trim();
   const ipLabel = (($('comment-ip-label') && $('comment-ip-label').value) || "").trim();
   const replyType = ($('comment-type') && $('comment-type').value) || "";
+  const intentTier = ($('comment-intent') && $('comment-intent').value) || "";
   const minLikes = +(($('comment-min-likes') && $('comment-min-likes').value) || 0);
   if (query) params.set("q", query);
   if (ipLabel) params.set("ip_label", ipLabel);
   if (replyType) params.set("reply_type", replyType);
+  if (intentTier) params.set("intent_tier", intentTier);
   if (Number.isFinite(minLikes) && minLikes > 0) params.set("min_like_count", String(Math.floor(minLikes)));
   params.set("sort", ($('comment-sort') && $('comment-sort').value) || "captured_desc");
   let payload;
@@ -7690,7 +7857,7 @@ async function refreshComments(resetPage = false) {
   $("comment-table").innerHTML = rows.map(r => {
     return `<tr>
     <td class="watch-record-check"><label class="watch-record-selection" title="选择这条评论"><input type="checkbox" data-id="${r.id}" aria-label="选择这条评论" onchange="commentToggleOne(${r.id}, this.checked)" ${selComment.has(r.id) ? "checked" : ""}></label></td>
-    <td class="watch-record-main"><div class="watch-record-text">${r.is_reply ? '<span class="mut">回复 · </span>' : ""}${esc(r.text || "")}</div>${watchRecordSourceMarkup("comment", r)}</td>
+    <td class="watch-record-main"><div class="watch-record-text">${intentBadgeMarkup(r)}${r.is_reply ? '<span class="mut">回复 · </span>' : ""}${esc(r.text || "")}</div>${watchRecordSourceMarkup("comment", r)}</td>
     <td class="mut comment-user watch-record-user" data-label="用户"><div>${esc(r.user_nickname || "")}${r.ip_label ? ` · ${esc(r.ip_label)}` : ""}</div>${r.user_sec_uid ? `<div class="comment-user-sec" title="${esc(r.user_sec_uid)}">sec_uid: ${esc(r.user_sec_uid)}</div>` : ""}</td>
     <td class="mut num watch-record-likes" data-label="赞">${fmtNum(r.like_count)}</td>
     <td class="watch-record-time">${watchRecordTimeMarkup("comment", r)}</td>
