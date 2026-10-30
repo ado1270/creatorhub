@@ -10,6 +10,7 @@ from sqlmodel import select
 from app import db, selfcheck
 from app.config import Config, PlanConfig
 from app.models import CommentRecord, CommentWatch, DouyinAccount
+from app.settings import set_setting
 
 
 class _Checks(dict):
@@ -211,6 +212,36 @@ class SelfCheckTests(unittest.IsolatedAsyncioTestCase):
             if item["status"] in ("fail", "warn"):
                 self.assertTrue(item["fix"].strip(),
                                 f"{item['id']} 报了问题但没给动作")
+
+    async def test_intent_ai_off_is_info_not_a_problem(self):
+        """没开 AI 是一种选择，不是故障，但要说清代价。"""
+        result = await self._run()
+        self.assertEqual(result.status("intent"), "info")
+        self.assertIn("高意向词", result.by_id("intent")["detail"])
+
+    async def test_intent_ai_switch_without_config_is_a_warning(self):
+        """开了开关却漏填模型，实际仍在硬筛 —— 这类静默失效必须被看见。"""
+        set_setting("intent_ai_enabled", "1")
+        result = await self._run()
+        self.assertEqual(result.status("intent"), "warn")
+        self.assertTrue(result.by_id("intent")["fix"].strip())
+
+    async def test_intent_ai_probe_success_and_failure(self):
+        set_setting("intent_ai_enabled", "1")
+        set_setting("intent_ai_base_url", "http://localhost:11434/v1")
+        set_setting("intent_ai_model", "qwen2.5:1.5b")
+        with patch.object(selfcheck.intent_ai, "score",
+                          new=AsyncMock(return_value=[{"score": 92, "label": "求购",
+                                                       "reason": ""}])):
+            result = await self._run(probe=True)
+        self.assertEqual(result.status("intent"), "pass")
+
+        with patch.object(selfcheck.intent_ai, "score",
+                          new=AsyncMock(side_effect=selfcheck.intent_ai.IntentAIError(
+                              "HTTP 401: invalid_api_key"))):
+            result = await self._run(probe=True)
+        self.assertEqual(result.status("intent"), "fail")
+        self.assertIn("401", result.by_id("intent")["detail"])
 
     async def test_summary_counts_match_items(self):
         result = await self._run()

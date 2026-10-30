@@ -4498,6 +4498,7 @@ async function loadSettings() {
       assign("intent-ai-timeout", "value", s.intent_ai_timeout || "60");
       assign("intent-ai-push-review", "checked", !!s.intent_ai_push_review);
       $("intent-ai-key").placeholder = s.intent_ai_api_key_set ? "已保存(留空=不修改)" : "可留空(本地 Ollama)";
+      syncIntentAiPreset();
     }
     if ($("lead-push-enabled")) {
       assign("lead-push-enabled", "checked", !!s.lead_push_enabled);
@@ -4925,6 +4926,37 @@ async function testAi() {
   });
 }
 
+// 模型来源预设：交付现场最常改的就是这几项，选一家把地址、建议模型、
+// 每批条数和超时一次填好；API Key 只能客户自己贴，我们不代持。
+const INTENT_AI_PRESETS = {
+  qwen: { label: "阿里云通义千问", base: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          model: "qwen3.7-flash", batch: "16", timeout: "30", needKey: true },
+  deepseek: { label: "DeepSeek", base: "https://api.deepseek.com/v1",
+              model: "deepseek-chat", batch: "16", timeout: "30", needKey: true },
+  ollama: { label: "本机 Ollama", base: "http://localhost:11434/v1",
+            model: "qwen2.5:1.5b", batch: "8", timeout: "120", needKey: false },
+};
+
+function applyIntentAiPreset(name) {
+  const preset = INTENT_AI_PRESETS[name];
+  if (!preset) return "";
+  $("intent-ai-base").value = preset.base;
+  $("intent-ai-model").value = preset.model;
+  $("intent-ai-batch").value = preset.batch;
+  $("intent-ai-timeout").value = preset.timeout;
+  if (preset.needKey) $("intent-ai-key").placeholder = "必填：这家需要 API Key";
+  return `已填入${preset.label}的地址与建议参数，贴上 API Key 后先点「试判几条」`;
+}
+
+// 已保存的地址回头显示成来源，省得客户对着一串 URL 发懵。
+function syncIntentAiPreset() {
+  if (!$("intent-ai-preset")) return "";
+  const base = ($("intent-ai-base").value || "").trim().replace(/\/+$/, "");
+  const hit = Object.keys(INTENT_AI_PRESETS).find(key => INTENT_AI_PRESETS[key].base === base);
+  $("intent-ai-preset").value = hit || "";
+  return hit || "";
+}
+
 function intentAiBody() {
   const body = {
     intent_ai_enabled: $("intent-ai-enabled").checked,
@@ -4956,6 +4988,7 @@ async function saveIntentAiSettings() {
       const s = await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(intentAiBody()) });
       $("intent-ai-key").value = "";
       $("intent-ai-key").placeholder = s.intent_ai_api_key_set ? "已保存(留空=不修改)" : "可留空(本地 Ollama)";
+      syncIntentAiPreset();
       $("intent-ai-msg").textContent = "已保存 ✓ " + (s.intent_ai_enabled ? "AI 判定已生效" : "(当前按高意向词硬筛)");
       toast("AI 意向设置已保存", "ok");
     } catch (e) { $("intent-ai-msg").textContent = "失败: " + e.message; toast("保存失败:" + e.message, "err"); }

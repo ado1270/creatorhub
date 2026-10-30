@@ -15,12 +15,14 @@ from sqlalchemy import func, true
 from sqlmodel import select
 
 from .db import get_session
+from . import intent_ai
 from .lead_push import lead_push_settings, outbox_stats, probe_lead_push
 from .license import effective_status
 from .models import (AccountRiskState, CommentRecord, CommentWatch,
                      DanmakuWatch, DouyinAccount, KeywordCollectionComment,
                      KeywordCollectionJob, MonitorTarget)
 from .quota import monthly_lead_usage, utc_month_start
+from .settings import get_setting
 
 # 一眼就能看出不是真 Key 的写法。客户手填时很容易留下这种占位内容。
 _PLACEHOLDER_PATTERNS = (
@@ -191,6 +193,42 @@ async def run_selfcheck(cfg, *, probe: bool = False) -> dict:
                 f"{len(comment_watches)} 个评论监控都在按周期扫描，"
                 + (f"最近一次扫描 {_age_text(max(scanned))}。" if scanned
                    else "尚未有扫描记录。")))
+
+    # ── AI 意向判定（开错了比没开更糟：静默回退没人看得见）──
+    ai_on = get_setting("intent_ai_enabled", "0") == "1"
+    ai_cfg = intent_ai.config()
+    if not ai_on:
+        checks.append(_check(
+            "intent", "采集", "AI 意向判定", "info",
+            "未启用，评论只按高意向词硬筛。说法不同但明显是买家的评论"
+            "（如「可以去自提吗」）会被筛掉。",
+            "在设置 → AI 意向判定里开启，先用「试判几条」看判得准不准。"))
+    elif ai_cfg is None:
+        checks.append(_check(
+            "intent", "采集", "AI 意向判定", "warn",
+            "开关已打开，但接口地址或模型名称没填全，实际仍在按高意向词硬筛。",
+            "补齐接口地址与模型名称（云端还要填 API Key），保存后点「试判几条」。"))
+    elif probe:
+        try:
+            verdicts = await intent_ai.score(
+                [{"text": "这车还在不"}, {"text": "老板发大财"}], ai_cfg)
+            call = intent_ai.decide({"text": "这车还在不"}, verdicts[0], ai_cfg, [])
+            checks.append(_check(
+                "intent", "采集", "AI 意向判定", "pass",
+                f"{ai_cfg.model} 连通，样例「这车还在不」判为 "
+                f"{call['label'] or '未判定'} {call['score']} 分。"))
+        except intent_ai.IntentAIError as exc:
+            checks.append(_check(
+                "intent", "采集", "AI 意向判定", "fail",
+                f"开关已打开，但调用 {ai_cfg.model} 失败：{str(exc)[:180]}。"
+                "扫描时会自动回退高意向词，AI 这一路等于没在工作。",
+                "核对接口地址、API Key 与模型名称；本地 Ollama 先确认服务在跑。"))
+    else:
+        checks.append(_check(
+            "intent", "采集", "AI 意向判定", "pass",
+            f"{ai_cfg.model}：高意向线 {ai_cfg.high} 分，待人工线 {ai_cfg.review} 分，"
+            f"每批 {ai_cfg.batch} 条；灰区{'也推送' if ai_cfg.push_review else '只入库不推送'}。",
+            "点「运行自检（含连通探测）」会真的调用一次模型验证。"))
 
     if last_job:
         if last_job.status == "failed":

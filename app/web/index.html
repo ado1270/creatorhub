@@ -2890,14 +2890,26 @@
         <input type="checkbox" id="intent-ai-enabled">
         <span class="switch-copy"><b>启用 AI 判定评论意向</b><span>关闭时按高意向词硬筛；开启后关键词命中仍算高意向，AI 负责捞回说法不同的客户</span></span>
       </label>
+      <div class="form-field">
+        <label for="intent-ai-preset">模型来源</label>
+        <select id="intent-ai-preset" onchange="applyIntentAiPreset(this.value)">
+          <option value="">手动填写</option>
+          <option value="qwen">阿里云通义千问（百炼）</option>
+          <option value="deepseek">DeepSeek</option>
+          <option value="ollama">本机 Ollama（评论不出这台电脑）</option>
+        </select>
+        <div class="field-help">选一家会自动填好接口地址、建议模型、每批条数和超时；API Key 要自己贴</div>
+      </div>
       <div class="form-grid">
         <div class="form-field">
           <label for="intent-ai-base">接口地址</label>
-          <input id="intent-ai-base" type="url" inputmode="url" autocomplete="url" placeholder="https://api.deepseek.com/v1 或 http://localhost:11434/v1">
+          <input id="intent-ai-base" type="url" inputmode="url" autocomplete="url"
+            placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
+          <div class="field-help">通义千问（百炼）填 https://dashscope.aliyuncs.com/compatible-mode/v1；DeepSeek 是 https://api.deepseek.com/v1；本机 Ollama 是 http://localhost:11434/v1</div>
         </div>
         <div class="form-field">
           <label for="intent-ai-model">模型名称</label>
-          <input id="intent-ai-model" autocomplete="off" placeholder="deepseek-chat / qwen2.5:1.5b">
+          <input id="intent-ai-model" autocomplete="off" placeholder="qwen3.7-flash / qwen3.8-flash / deepseek-chat">
         </div>
         <div class="form-field">
           <label for="intent-ai-key">API Key</label>
@@ -2905,7 +2917,7 @@
             <input id="intent-ai-key" type="password" autocomplete="new-password" placeholder="留空则不修改已保存的 Key">
             <button class="input-action" type="button" onclick="toggleSecretInput('intent-ai-key',this)" aria-label="显示 API Key" aria-pressed="false" title="显示或隐藏 API Key"><svg><use href="#i-eye"/></svg></button>
           </div>
-          <div class="field-help">本地 Ollama 可留空；只存本地数据库，不回显</div>
+          <div class="field-help">本地 Ollama 可留空，云端模型必填；Key 只存本地数据库，不回显</div>
         </div>
         <div class="form-field">
           <label for="intent-ai-high">高意向分数线</label>
@@ -2939,7 +2951,7 @@
       </label>
       <div class="form-note">
         <svg aria-hidden="true"><use href="#i-info"/></svg>
-        <span>时间范围、地区、排除词仍是硬条件，AI 只判「有没有意向」。整批调用失败时自动回退高意向词，不会因为 AI 挂了就没有线索。</span>
+        <span>时间范围、地区、排除词仍是硬条件，AI 只判「有没有意向」。整批调用失败时自动回退高意向词，不会因为 AI 挂了就没有线索。开启后每条评论的文字、昵称、IP 属地会发给你填写的模型服务商，用云端模型前请确认这一点可以接受；不接受就改成本机 Ollama，数据不出这台电脑。</span>
       </div>
       <div class="form-actions">
         <span class="status-text" id="intent-ai-msg" role="status" aria-live="polite"></span>

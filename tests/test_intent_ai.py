@@ -155,6 +155,109 @@ class ScoreBatchTests(unittest.TestCase):
             intent_ai.chat = original
 
 
+class ChatGatewayCompatTests(unittest.TestCase):
+    """通义千问（阿里云百炼）这类网关的额外要求：关思考模式、temperature > 0。"""
+
+    class _Resp:
+        def __init__(self, status, text="", payload=None):
+            self.status_code, self.text = status, text
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def test_adapt_body_fixes_thinking_and_temperature(self):
+        body = {"model": "qwen3-flash", "temperature": 0}
+        self.assertTrue(intent_ai._adapt_body(
+            body, "parameter.enable_thinking must be set to false for "
+                  "non-streaming calls"))
+        self.assertIs(body["enable_thinking"], False)
+
+        body = {"model": "qwen3-flash", "temperature": 0}
+        self.assertTrue(intent_ai._adapt_body(body, "temperature must be greater than 0"))
+        self.assertEqual(body["temperature"], 0.01)
+
+        # 认不出来的报错不乱改请求体，交给上层原样报错。
+        body = {"model": "m", "temperature": 0}
+        self.assertFalse(intent_ai._adapt_body(body, "HTTP 401: invalid api key"))
+        self.assertNotIn("enable_thinking", body)
+
+    def _run_retry(self, first_text):
+        sent = []
+
+        async def fake_post(body, cfg):
+            sent.append(dict(body))
+            if len(sent) == 1:
+                return self._Resp(400, first_text)
+            return self._Resp(200, payload={
+                "choices": [{"message": {"content": "0|询价"}}]})
+
+        original = intent_ai._post
+        intent_ai._post = fake_post
+        try:
+            out = asyncio.run(intent_ai.chat(
+                [{"role": "user", "content": "hi"}], CFG))
+        finally:
+            intent_ai._post = original
+        return out, sent
+
+    def test_chat_retries_once_with_fixed_body(self):
+        out, sent = self._run_retry(
+            "parameter.enable_thinking must be set to false for non-streaming calls")
+        self.assertEqual(out, "0|询价")
+        self.assertEqual(len(sent), 2)
+        self.assertNotIn("enable_thinking", sent[0])   # 首发保持标准 OpenAI 字段
+        self.assertIs(sent[1]["enable_thinking"], False)
+
+    def test_chat_reports_error_when_retry_also_fails(self):
+        async def fake_post(body, cfg):
+            return ChatGatewayCompatTests._Resp(401, "invalid_api_key")
+
+        original = intent_ai._post
+        intent_ai._post = fake_post
+        try:
+            with self.assertRaises(intent_ai.IntentAIError) as ctx:
+                asyncio.run(intent_ai.chat([{"role": "user", "content": "hi"}], CFG))
+        finally:
+            intent_ai._post = original
+        self.assertIn("HTTP 401", str(ctx.exception))
+
+
+class ThinkingModeTests(unittest.TestCase):
+    """通义千问默认开着思考模式：非流式判定不该为没人看的思考过程付钱。"""
+
+    def test_detected_by_host_or_model_name(self):
+        def hit(base, model):
+            cfg = intent_ai.IntentAIConfig(base_url=base, api_key="", model=model)
+            return intent_ai.wants_thinking_off(cfg)
+        self.assertTrue(hit("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen3.7-flash"))
+        self.assertTrue(hit("https://ws-abc.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+                            "qwen3.7-flash"))
+        self.assertTrue(hit("http://localhost:11434/v1", "qwen2.5:1.5b"))
+        self.assertFalse(hit("https://api.deepseek.com/v1", "deepseek-chat"))
+        self.assertFalse(hit("http://localhost:11434/v1", "llama3:8b"))
+
+    def test_first_request_already_carries_the_flag(self):
+        sent = []
+
+        async def fake_post(body, cfg):
+            sent.append(dict(body))
+            return ChatGatewayCompatTests._Resp(
+                200, payload={"choices": [{"message": {"content": "0|询价"}}]})
+
+        original = intent_ai._post
+        intent_ai._post = fake_post
+        try:
+            cfg = dataclasses.replace(CFG, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                      model="qwen3.7-flash")
+            out = asyncio.run(intent_ai.chat([{"role": "user", "content": "hi"}], cfg))
+        finally:
+            intent_ai._post = original
+        self.assertEqual(out, "0|询价")
+        self.assertEqual(len(sent), 1)                    # 不用等报错再重发
+        self.assertIs(sent[0]["enable_thinking"], False)
+
+
 class ScreenIntentTests(unittest.TestCase):
     def setUp(self):
         self.engine = MonitorEngine.__new__(MonitorEngine)

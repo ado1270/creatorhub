@@ -34,12 +34,12 @@ DEFAULT_BATCH = 12        # 一次请求带多少条评论（本地小模型建�
 MAX_TEXT = 160            # 单条评论进提示词的长度上限
 MAX_REASON = 60
 
-LABELS = ("询价", "求购", "求联系方式", "约看车", "售后", "同行", "广告", "闲聊", "无关")
+LABELS = ("询价", "求购", "求联系方式", "约看车", "问车况", "售后", "同行", "广告", "闲聊", "无关")
 
 # 类别 -> 分数。让模型只选类别、分数由这里查表：实测本地小模型自由打分时
 # 会把「抖音骗子多」也打成 90 分（分数不可信），而选类别的准确率明显更高。
 # 模型同时给了数字分数时以数字为准（见 decide），这里只兜住「只回类别」的情况。
-CATEGORY_SCORES = {"询价": 95, "求购": 92, "求联系方式": 90, "约看车": 88,
+CATEGORY_SCORES = {"询价": 95, "求购": 92, "求联系方式": 90, "约看车": 88, "问车况": 86,
                    "售后": 25, "同行": 10, "广告": 5, "闲聊": 8, "无关": 3}
 
 _CATEGORY_GUIDE = """类别定义：
@@ -47,7 +47,8 @@ _CATEGORY_GUIDE = """类别定义：
 - 求购：想买、要、还有货吗、还有车吗。例：这车还在不 我要一台
 - 求联系方式：要电话微信地址、怎么联系。例：怎么联系你 你在哪里
 - 约看车：约时间地点来看货。例：明天能去看吗
-- 售后：已经买过之后的维修退货等问题。例：刹车坏了怎么办
+- 问车况：还没买，先问成色、参数、手续、能不能用。例：电池能跑多少公里 有没有过户手续 刹车有没有异响
+- 售后：已经买过之后的维修退货等问题。例：我上月买的刹车坏了怎么办
 - 同行：自己也收车卖车、谈合作。例：我也收车 长期合作呗
 - 广告：留自己号引流、骗术提醒、无关推销。例：加我微信123 抖音骗子多别信
 - 闲聊：夸视频、玩梗、无关感慨。例：老板发大财 这车真好看
@@ -129,7 +130,7 @@ def build_messages(comments: list[dict], business: str = "") -> list[dict]:
         f"生意：{biz}\n"
         "任务：给下面每条评论选一个类别，只能从这些类别里选：\n"
         + _CATEGORY_GUIDE + "\n"
-        "判断底线：问价、要货、要联系方式、约来看 = 潜在客户；"
+        "判断底线：问价、要货、要联系方式、约来看、问车况手续 = 潜在客户；"
         "夸你、评论视频本身、留他自己的微信号引流、自己也收车的同行 = 不是客户。\n"
         f"共 {len(rows)} 条，必须回 {len(rows)} 行。\n"
         "评论：\n" + "\n".join(rows) + "\n"
@@ -233,19 +234,59 @@ def parse_verdicts(content: str, count: int) -> list[dict]:
     return []
 
 
-async def chat(messages: list[dict], cfg: IntentAIConfig) -> str:
-    """OpenAI 兼容 /chat/completions 调用，与文案生成同一条通路。"""
-    body = {"model": cfg.model, "messages": messages,
-            "temperature": 0, "max_tokens": 700}
+# 阿里云百炼（通义千问）这类网关有两个坑：
+# 1) Qwen3 默认开着「思考模式」。非流式调用不会报错，只是默默多想一遍——
+#    实测同样三条评论的判定，输出从 11 token 涨到 672 token，一次调用 8.6 秒
+#    变 0.6 秒的差距，费用和时间都白烧在没人看的思考过程上。所以认出是
+#    千问/百炼就显式关掉思考模式。
+# 2) 有的部署拒绝 temperature=0，报错文案里带 temperature，识别后补一次重发。
+# 其他网关（DeepSeek / Ollama）保持标准 OpenAI 字段，不乱加参数。
+_THINK_HINTS = ("thinking", "stream", "流式")
+_TEMP_HINTS = ("temperature",)
+
+
+def wants_thinking_off(cfg: IntentAIConfig) -> bool:
+    """认出通义千问 / 阿里云百炼：这两家的模型名和域名都很有辨识度。"""
+    base = (cfg.base_url or "").casefold()
+    model = (cfg.model or "").casefold()
+    return "aliyuncs.com" in base or model.startswith("qwen")
+
+
+def _adapt_body(body: dict, message: str) -> bool:
+    """按网关的报错原因修一次请求体。返回是否真的有改动。"""
+    text = (message or "").casefold()
+    changed = False
+    if any(hint in text for hint in _THINK_HINTS):
+        body["enable_thinking"] = False
+        changed = True
+    if any(hint in text for hint in _TEMP_HINTS) and body.get("temperature", 0) <= 0:
+        body["temperature"] = 0.01
+        changed = True
+    return changed
+
+
+async def _post(body: dict, cfg: IntentAIConfig):
     headers = {"Content-Type": "application/json"}
     if cfg.api_key:
         headers["Authorization"] = f"Bearer {cfg.api_key}"
     try:
         async with httpx.AsyncClient(timeout=cfg.timeout) as client:
-            resp = await client.post(f"{cfg.base_url}/chat/completions",
+            return await client.post(f"{cfg.base_url}/chat/completions",
                                      json=body, headers=headers)
     except Exception as exc:
         raise IntentAIError(f"请求失败: {type(exc).__name__}: {exc}") from exc
+
+
+async def chat(messages: list[dict], cfg: IntentAIConfig) -> str:
+    """OpenAI 兼容 /chat/completions 调用，与文案生成同一条通路。"""
+    body = {"model": cfg.model, "messages": messages,
+            "temperature": 0, "max_tokens": 700}
+    if wants_thinking_off(cfg):
+        body["enable_thinking"] = False
+    resp = await _post(body, cfg)
+    if resp.status_code >= 400 and _adapt_body(body, resp.text):
+        # 认出来的参数问题就重发一次；仍然失败按原样报给界面。
+        resp = await _post(body, cfg)
     if resp.status_code >= 400:
         raise IntentAIError(f"HTTP {resp.status_code}: {resp.text[:160]}")
     try:
