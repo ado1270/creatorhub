@@ -110,3 +110,36 @@ def test_direct_environment_uses_account_locale_and_viewport():
         "locale": "zh-TW", "accept_language": "zh-TW,zh;q=0.8",
         "screen_width": 1440, "screen_height": 900,
     }
+
+
+def test_device_scope_is_always_this_machine():
+    """账号永远跑在这台机器上，设备主体隔离不能被 Profile 独立掩盖。"""
+    cfg = Config()
+    accounts = [
+        account(1, profile="profiles/a", proxy="http://proxy-a", state="one"),
+        account(2, profile="profiles/b", proxy="http://proxy-b", state="two"),
+    ]
+
+    matrix = build_transport_matrix(cfg, accounts)
+
+    for row in matrix["accounts"]:
+        assert row["device_scope"] == "本机"
+        assert not row["device_isolated"]
+        assert row["device_shared_count"] == 2
+    assert matrix["device"]["shared"] is True
+    assert matrix["device"]["account_count"] == 2
+    # 指引要说到「另一台电脑」这件事上，而不是只报个状态
+    assert "另一台电脑" in matrix["device"]["guidance"]
+    # 就算 Profile/登录态/出口三项全绿，设备主体这一栏仍要说实话
+    assert all(row["profile_isolated"] for row in matrix["accounts"])
+
+
+def test_single_account_has_no_same_machine_risk():
+    cfg = Config()
+    matrix = build_transport_matrix(cfg, [
+        account(1, profile="profiles/a", proxy="http://proxy-a", state="one")])
+
+    row = matrix["accounts"][0]
+    assert row["device_isolated"] is True
+    assert matrix["device"]["shared"] is False
+    assert "没有同机关联风险" in matrix["device"]["guidance"]

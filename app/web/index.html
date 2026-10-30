@@ -799,6 +799,7 @@
   .transport-mode.manual,.transport-mode.deferred { color:var(--mut); background:var(--surface-2); }
   .isolation-stack { display:flex; flex-wrap:wrap; gap:5px; }
   .isolation-note { color:var(--mut-2); font-size:11px; line-height:1.45; margin-top:5px; }
+  .isolation-warn { color:var(--warn); font-size:12px; line-height:1.6; white-space:normal; }
   table { width:100%; border-collapse:collapse; }
   thead th { position:sticky; top:0; z-index:1; }
   th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line-soft); font-size:13px; vertical-align:middle; white-space:nowrap; }
@@ -3144,8 +3145,8 @@
         </table></div>
         <h3 style="margin:4px 0 0">账号环境隔离</h3>
         <div class="table-wrap"><table aria-label="多账号 API 与浏览器环境隔离状态">
-          <thead><tr><th>账号</th><th>浏览器 Profile</th><th>API 登录态/会话</th><th>网络出口</th><th>环境编号</th></tr></thead>
-          <tbody id="transport-isolation-body"><tr><td colspan="5"><div class="empty">正在检查账号环境…</div></td></tr></tbody>
+          <thead><tr><th>账号</th><th>浏览器 Profile</th><th>API 登录态/会话</th><th>网络出口</th><th>设备主体</th><th>环境编号</th></tr></thead>
+          <tbody id="transport-isolation-body"><tr><td colspan="6"><div class="empty">正在检查账号环境…</div></td></tr></tbody>
         </table></div>
         <p class="field-help" id="transport-matrix-status" role="status" aria-live="polite"></p>
       </div>

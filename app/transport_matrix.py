@@ -187,6 +187,22 @@ def build_transport_matrix(cfg: Any, accounts: Iterable[Any]) -> dict[str, Any]:
     profile_counts = Counter(value for value in profile_keys if value)
     proxy_counts = Counter(value for value in proxy_keys if value)
     state_counts = Counter(value for value in state_keys if value)
+    # 设备主体隔离：软件隔离（独立 Profile / 独立指纹 / 独立登录态）和
+    # 设备主体隔离是两回事。同一套 CreatorHub 里的所有账号，跑在同一台
+    # 物理机器上 —— 硬件指纹、显卡、主板这些平台看得见的东西还是共享的。
+    # 体检表以前只写「Profile 独立」，客户会以为连设备也隔离了，那是误导。
+    device_shared = len(accounts) >= 2
+    if device_shared:
+        device_guidance = (
+            f"本机有 {len(accounts)} 个账号：软件隔离已生效（独立 Profile / "
+            "独立指纹 / 独立登录态），但设备主体仍是同一台机器，平台看得见的"
+            "硬件指纹与出口依然共享。要真正断开，请在另一台电脑上装一套 "
+            "CreatorHub，用同一个客户账号登录后重新扫码添加这个号，"
+            "再回本机删掉它 —— 设备主体独立比任何出口隔离都管用，"
+            "而且每台设备还自带各自的出口。"
+        )
+    else:
+        device_guidance = "本机仅此一个账号，没有同机关联风险。"
     isolation = []
     for account, profile_key, proxy_key, state_key in zip(
             accounts, profile_keys, proxy_keys, state_keys):
@@ -217,6 +233,10 @@ def build_transport_matrix(cfg: Any, accounts: Iterable[Any]) -> dict[str, Any]:
             "api_session_isolated": True,
             "network_isolated": network_isolated,
             "network_scope": "专属代理" if network_isolated else "共享出口",
+            # 设备主体永远是「本机」：这套软件跑在哪台机器，账号就在哪台机器。
+            "device_scope": "本机",
+            "device_isolated": not device_shared,
+            "device_shared_count": len(accounts),
             "api_environment_aligned": bool(
                 getattr(account, "ua", "") and getattr(account, "locale", "")
                 and getattr(account, "viewport_w", 0)
@@ -226,6 +246,12 @@ def build_transport_matrix(cfg: Any, accounts: Iterable[Any]) -> dict[str, Any]:
             "warnings": warnings,
         })
     return {
+        "device": {
+            "scope_label": "本机",
+            "account_count": len(accounts),
+            "shared": device_shared,
+            "guidance": device_guidance,
+        },
         "settings": {
             "douyin_read_mode": _setting_value(cfg, "douyin_read_mode", "hybrid"),
             "douyin_profile_mode": _setting_value(cfg, "douyin_profile_mode", "hybrid"),

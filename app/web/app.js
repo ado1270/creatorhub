@@ -4411,9 +4411,10 @@ function renderTransportMatrix(data) {
       <td>${badge(account.profile_isolated, "独立", "缺失/重复")}</td>
       <td><div class="isolation-stack">${badge(account.credential_isolated, "登录态独立", "登录态待检查")}${badge(account.api_session_isolated, "会话独立", "会话共享")}${badge(account.api_environment_aligned, "参数对齐", "参数未对齐")}</div></td>
       <td>${badge(account.network_isolated, "专属代理", account.network_scope || "共享出口")}</td>
+      <td>${badge(account.device_isolated, "独立设备", `本机${Number(account.device_shared_count) > 1 ? ` · 与另外 ${Number(account.device_shared_count) - 1} 个号同机` : ""}`)}</td>
       <td><code>${esc(account.environment_id || "-")}</code>${account.warnings?.length ? `<div class="isolation-note">${account.warnings.map(esc).join("；")}</div>` : ""}</td>
     </tr>`;
-  }).join("") : empty(5, "尚未添加账号", "i-user");
+  }).join("") : empty(6, "尚未添加账号", "i-user");
 }
 async function refreshTransportMatrix() {
   const status = $("transport-matrix-status");
@@ -4421,7 +4422,12 @@ async function refreshTransportMatrix() {
     const data = await api("/api/settings/transport-matrix");
     TRANSPORT_MATRIX = data;
     renderTransportMatrix(data);
-    if (status) status.textContent = `已核对 ${data.rows?.length || 0} 项能力、${data.accounts?.length || 0} 个账号环境`;
+    const device = data?.device || {};
+    const summary = `已核对 ${data.rows?.length || 0} 项能力、${data.accounts?.length || 0} 个账号环境`;
+    if (status) {
+      status.textContent = device.guidance ? `${summary}。${device.guidance}` : summary;
+      status.classList.toggle("isolation-warn", !!device.shared);
+    }
     return data;
   } catch (error) {
     if (status) status.textContent = "兼容矩阵读取失败：" + error.message;
