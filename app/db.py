@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from sqlalchemy import event, func, inspect, select, text
+import os
 from sqlmodel import SQLModel, Session, create_engine
 
 from .models import (AccountIdReservation, DouyinAccount, ContentRecord,
@@ -149,12 +150,34 @@ def _auto_migrate(engine):
                 existing_indexes.add(index.name)
 
 
+def _tighten_local_permissions(db_path: str) -> None:
+    """把本地库和它的目录收紧到只有当前用户能读。
+
+    库里躺着账号登录态（storage_state、Cookie）和 gdb15 的推送 Key。
+    默认建出来的文件是 644 —— 同机器上别的用户顺手就能拷走，
+    拿这个登录态就能登进客户的抖音号。这件事只有一行的成本，
+    不做的话风险和成本完全不成比例。
+    """
+    targets = [
+        (db_path, 0o600),
+        (os.path.dirname(os.path.abspath(db_path)), 0o700),
+    ]
+    for path, mode in targets:
+        try:
+            if os.path.exists(path):
+                os.chmod(path, mode)
+        except OSError:
+            # Windows 上 chmod 只能设只读位，失败不影响使用。
+            pass
+
+
 def init_db(db_path: str):
     global _engine
     _engine = create_engine(
         f"sqlite:///{db_path}",
         connect_args={"check_same_thread": False},
     )
+    _tighten_local_permissions(db_path)
     inspector = inspect(_engine)
     legacy_schedules = inspector.has_table("publishtask") and (
         "scheduled_at_is_utc" not in {
