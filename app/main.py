@@ -131,8 +131,8 @@ from .selfcheck import run_selfcheck
 from .gdb15_open import (CSV_MIME, XLSX_MIME, OpenApiError, build_csv,
                          build_xlsx, collect_leads, open_api_status,
                          push_status, save_open_api_settings, since_days_ago)
-from .license import (effective_status, license_enforced, license_settings,
-                      license_loop, verify as verify_license)
+from .license import (account_budget, effective_status, license_enforced,
+                      license_settings, license_loop, verify as verify_license)
 from .intake import (create_mobile_session, fetch_recent as fetch_intake_recent,
                      intake_loop, intake_ready, process_pending)
 from .quota import local_usage_snapshot, monitor_slot_usage, monthly_lead_usage
@@ -1350,6 +1350,8 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
                 hint="扫码已确认，正在校验登录态并同步账号资料",
                 environment=login_environment,
             )
+            # 多了一个号，立刻告诉服务端（额度按租户总数算，见 _report_account_usage）。
+            await _report_account_usage()
 
             if is_xhs and not creator:
                 # 主站登录已经给出 user/me（或二维码完成信号）。保留当前
@@ -1664,7 +1666,10 @@ async def login_cookie(body: CookieIn):
         # 分配画像(profile/UA/指纹/代理):Cookie 会在首次开持久 profile 时桥接注入
         ensure_identity(acc, cfg, session=s, assign_proxy=True)
         s.add(acc); s.commit(); s.refresh(acc)
-        return {"account_id": acc.id, "nickname": acc.nickname}
+        account_id = acc.id
+        account_nickname = acc.nickname
+    await _report_account_usage()
+    return {"account_id": account_id, "nickname": account_nickname}
 
 
 @app.get("/api/overview/summary")
@@ -3256,6 +3261,7 @@ async def del_account(account_id: int):
                 # independent ID reservation prevents reassignment to new users.
                 s.delete(acc)
                 s.commit()
+        await _report_account_usage()
         for manager in (getattr(engine, "dm_automation", None), im_receiver):
             stop_account = getattr(manager, "stop_account", None)
             if callable(stop_account):
@@ -8167,8 +8173,28 @@ def _require_monitor_slot(session, *, adding: bool = False) -> None:
             "请暂停其他监控或升级套餐。")
 
 
+async def _report_account_usage() -> None:
+    """账号数量变了就立刻上报一次。
+
+    服务端按「租户名下所有实例的账号数之和」判断还剩几个号可绑。
+    本地加减号之后必须马上告诉它，否则另一台机器会以为还有额度，
+    客户就能在两台机器上各建满号的套餐。
+    """
+    try:
+        await verify_license(cfg)
+    except Exception as exc:
+        print(f"[license] 上报账号用量失败：{exc!r}")
+
+
 def _require_account_slot(session) -> None:
     limit = cfg.plan.max_accounts
+    # 服务端按「整个租户名下所有机器的账号数之和」发额度：
+    # 客户在两台机器上各建满 max_accounts 个号，套餐承诺的号数就被翻倍了。
+    # 这里取两者的较小值 —— 本机不能超过套餐给的总数，也不能超过服务端
+    # 按其他机器已用额度算出来的余额。
+    budget = account_budget()
+    if budget is not None:
+        limit = budget if limit is None else min(int(limit), int(budget))
     if limit is None:
         return
     used = int(session.exec(select(func.count(DouyinAccount.id))).one())

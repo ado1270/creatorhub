@@ -267,6 +267,15 @@ async def verify(cfg, *, settings: dict | None = None) -> dict:
                expires_at=str(data.get("packageExpiresAt") or ""))
     _apply_plan(cfg, plan)
     instance = data.get("instance") or {}
+    # 服务端按「整个租户的账号总数」算额度，这里记下本机还能再放几个。
+    # 客户在两台机器上各建满号的漏洞，就靠这个数堵住。
+    accounts_allowed = instance.get("accountsAllowed")
+    if accounts_allowed is not None:
+        try:
+            set_setting("license_accounts_allowed",
+                        str(max(0, int(accounts_allowed))))
+        except (TypeError, ValueError):
+            pass
     return {
         "checked": True,
         "status": status,
@@ -275,7 +284,22 @@ async def verify(cfg, *, settings: dict | None = None) -> dict:
         "instance_allowed": bool(instance.get("allowed", True)),
         "active_instances": instance.get("activeInstances"),
         "max_instances": instance.get("maxInstances"),
+        "accounts_allowed": accounts_allowed,
     }
+
+
+def account_budget() -> int | None:
+    """服务端下发的「本机还能再放几个账号」。
+
+    没有下发过就返回 None（不额外限制，交给套餐上限管）。
+    """
+    raw = get_setting("license_accounts_allowed", "")
+    if raw == "":
+        return None
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def collect_usage() -> dict:
