@@ -2606,7 +2606,10 @@
               <svg><use href="#i-eye"/></svg>
             </button>
           </div>
-          <p class="field-help">留空时复用线索推送的 Key。Key 只保存在本机，不会回显。</p>
+          <button class="ghost sm" type="button" id="license-key-clear" style="display:none"
+            onclick="clearLicenseApiKey()" title="删掉本机保存的这把授权 API Key，回到复用线索推送的 Key">
+            <svg><use href="#i-trash"/></svg>清除已存 Key</button>
+          <p class="field-help">留空时复用线索推送的 Key。要单独填就填 gdb15 后台「套餐与用量」页「对接用 API Key」那把（<code>lk_</code> 开头）——卡密和 <code>gdb15_</code> 开头的开放 API Key 都不认。Key 只保存在本机，不会回显；存错了点上面「清除已存 Key」删掉，删掉后自动复用上方的推送 Key。</p>
         </div>
       </div>
       <p class="field-help">开启并成功授权后，开关会被锁定：客户能直接改本机的
@@ -2785,7 +2788,10 @@
               <svg><use href="#i-eye"/></svg>
             </button>
           </div>
-          <p class="field-help">与「线索推送」那把 Key 不是同一把。在 gdb15 后台「开放 API」页单独签发，完整 Key 只显示一次。</p>
+          <button class="ghost sm" type="button" id="open-api-key-clear" style="display:none"
+            onclick="clearOpenApiKey()" title="删掉本机保存的开放 API Key，导出线索前先重新签发一把">
+            <svg><use href="#i-trash"/></svg>清除已存 Key</button>
+          <p class="field-help">与「线索推送」那把 Key 不是同一把。在 gdb15 后台「开放 API」页单独签发，开头是 <code>gdb15_</code>，完整 Key 只显示一次。存错了点上面「清除已存 Key」删掉，之后要再导线索得重新签发。</p>
         </div>
       </div>
       <div class="form-grid cols-auto">

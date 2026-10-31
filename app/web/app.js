@@ -4516,6 +4516,9 @@ async function loadSettings() {
       assign("open-api-url", "value", s.gdb15_open_base_url || "");
       $("open-api-key").placeholder = s.gdb15_open_api_key_set
         ? "已保存(留空=不修改)" : "开放 API Key";
+      // 已存有 Key 时才给「清除」这条路：留空是「不修改」，清掉必须明说。
+      const oake = $("open-api-key-clear");
+      if (oake) oake.style.display = s.gdb15_open_api_key_set ? "" : "none";
     }
     if ($("license-enabled")) {
       assign("license-enabled", "checked", !!s.license_enabled || !!s.license_enforced);
@@ -4524,6 +4527,8 @@ async function loadSettings() {
       assign("license-url", "value", s.license_url || "");
       $("license-key").placeholder = s.license_api_key_set
         ? "已保存(留空=不修改)" : "API Key";
+      const lic = $("license-key-clear");
+      if (lic) lic.style.display = s.license_api_key_set ? "" : "none";
     }
     csSyncAll();
   } catch (e) {}
@@ -4578,6 +4583,30 @@ async function saveOpenApiSettings() {
     } catch (e) {
       $("open-api-msg").textContent = "失败: " + e.message;
       toast("保存失败:" + e.message, "err");
+    }
+  });
+}
+
+// 这一框留空 = 「不修改已保存的 Key」，删掉只能走这个明确的动作。
+async function clearOpenApiKey() {
+  if (!confirm("删除本机保存的开放 API Key？之后要导线索，"
+    + "得去 gdb15「开放 API」页重新签发一把（完整 Key 只显示一次）。")) return;
+  $("open-api-msg").textContent = "清除中…";
+  await withBusy(evtBtn(), "清除中", async () => {
+    try {
+      const s = await api("/api/gdb15/open/settings", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clear_api_key: true }),
+      });
+      $("open-api-key").value = "";
+      $("open-api-key").placeholder = "开放 API Key";
+      const btn = $("open-api-key-clear");
+      if (btn) btn.style.display = s.api_key_set ? "" : "none";
+      $("open-api-msg").textContent = s.api_key_set ? "失败：仍未清除" : "已清除 ✓";
+      if (!s.api_key_set) toast("开放 API Key 已从本机删除", "ok");
+    } catch (e) {
+      $("open-api-msg").textContent = "失败: " + e.message;
+      toast("清除失败:" + e.message, "err");
     }
   });
 }
@@ -4806,6 +4835,32 @@ async function saveLicenseSettings() {
     } catch (e) {
       $("license-msg").textContent = "失败: " + e.message;
       toast("保存失败:" + e.message, "err");
+    }
+  });
+}
+
+// 同上：留空不修改。填错了想退回「复用线索推送的 Key」，就点这个。
+async function clearLicenseApiKey() {
+  if (!confirm("删除本机保存的授权 API Key？删掉后这里回到复用上方"
+    + "「线索推送」那把 Key（同一租户本来就认它）。")) return;
+  $("license-msg").textContent = "清除中…";
+  await withBusy(evtBtn(), "清除中", async () => {
+    try {
+      const s = await api("/api/settings", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ license_api_key_clear: true }),
+      });
+      $("license-key").value = "";
+      $("license-key").placeholder = s.license_api_key_set
+        ? "已保存(留空=不修改)" : "API Key";
+      const btn = $("license-key-clear");
+      if (btn) btn.style.display = s.license_api_key_set ? "" : "none";
+      $("license-msg").textContent = s.license_api_key_set ? "失败：仍未清除" : "已清除 ✓";
+      if (!s.license_api_key_set) toast("授权 API Key 已从本机删除", "ok");
+      await loadLicenseStatus();
+    } catch (e) {
+      $("license-msg").textContent = "失败: " + e.message;
+      toast("清除失败:" + e.message, "err");
     }
   });
 }

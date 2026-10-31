@@ -95,6 +95,31 @@ class ConfigTest(OpenApiTestBase):
         gdb15_open.save_open_api_settings(None, "")
         self.assertEqual(gdb15_open.open_api_key(), "gdb15_secret_key")
 
+    def test_card_code_is_rejected_at_save_time(self):
+        """卡密填进开放 API Key 框，要当场说清楚，不能等测试时回一句 401。"""
+        with self.assertRaises(ValueError) as ctx:
+            gdb15_open.save_open_api_settings(None, "JUFW-HDW6-TCK4-CDD4")
+        self.assertIn("卡密", str(ctx.exception))
+
+    def test_push_key_is_rejected_at_save_time(self):
+        with self.assertRaises(ValueError) as ctx:
+            gdb15_open.save_open_api_settings(
+                None, "lk_c2a1cddde580d0dc9a4573934c9a1a327703b44ad151399e")
+        self.assertIn("线索推送", str(ctx.exception))
+
+    def test_rejected_key_does_not_half_save_the_url(self):
+        """Key 填错就不该顺带把地址改了 —— 要么一起存，要么都不存。"""
+        gdb15_open.save_open_api_settings("https://www.gdb15.com", "gdb15_ok")
+        with self.assertRaises(ValueError):
+            gdb15_open.save_open_api_settings("https://other.example.com",
+                                              "JUFW-HDW6-TCK4-CDD4")
+        self.assertEqual(gdb15_open.open_api_base(),
+                         "https://www.gdb15.com/api/v1/open")
+
+    def test_real_open_api_key_passes_shape_check(self):
+        gdb15_open.save_open_api_settings(None, "gdb15_abc123")
+        self.assertEqual(gdb15_open.open_api_key(), "gdb15_abc123")
+
     def test_site_base_follows_push_address(self):
         set_setting("license_url", "")
         set_setting("lead_push_url", "https://www.gdb15.com/api/v1/leads/webhook")
@@ -210,6 +235,27 @@ class CollectTest(OpenApiTestBase):
             self._collect(handler,
                           base_url="https://www.gdb15.com/api/v1/open", api_key="k")
         self.assertIn("吊销", str(ctx.exception))
+
+    def test_401_with_card_code_names_the_card_code(self):
+        """已经存进去的卡密，点测试时也要说人话，别只说「Key 无效」。"""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"message": "API Key 无效"})
+
+        with self.assertRaises(gdb15_open.OpenApiError) as ctx:
+            self._collect(handler,
+                          base_url="https://www.gdb15.com/api/v1/open",
+                          api_key="JUFW-HDW6-TCK4-CDD4")
+        self.assertIn("卡密", str(ctx.exception))
+
+    def test_401_with_push_key_names_the_push_key(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"message": "API Key 无效"})
+
+        with self.assertRaises(gdb15_open.OpenApiError) as ctx:
+            self._collect(handler,
+                          base_url="https://www.gdb15.com/api/v1/open",
+                          api_key="lk_c2a1cddde580d0dc9a4573934c9a1a327703b44ad151399e")
+        self.assertIn("线索推送", str(ctx.exception))
 
     def test_403_is_translated(self):
         def handler(request: httpx.Request) -> httpx.Response:

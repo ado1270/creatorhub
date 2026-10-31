@@ -29,6 +29,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from .gdb15_keys import open_api_key_problem
 from .settings import get_setting, set_setting
 
 OPEN_API_PREFIX = "/api/v1/open"
@@ -168,16 +169,31 @@ def open_api_status() -> dict:
 
 
 def save_open_api_settings(base_url: str | None = None,
-                            api_key: str | None = None) -> dict:
+                            api_key: str | None = None,
+                            clear_api_key: bool = False) -> dict:
     """保存开放 API 配置。
 
     api_key 传空串等于「不修改」—— 页面上留空表示不改已保存的 Key，
     这是这套设置页一贯的约定。
+
+    真要删掉这一把 Key（填错了、或者客户不再用了），得明确传
+    clear_api_key。没有这条通道，一旦存进去就只能在页面上覆盖成另一把，
+    想退回到「没配 Key」的状态就只能去改本地数据库。
     """
+    if api_key is not None and api_key.strip():
+        problem = open_api_key_problem(api_key)
+        if problem:
+            # 存进去之后再点「测试」才报 401，客户只会以为 Key 被吊销了。
+            # 填错的那一下就说清楚，省得来回试。
+            # 放在最前面：地址和 Key 要么一起存，要么都不存，
+            # 不能因为 Key 填错就把地址先改了。
+            raise ValueError(problem)
     if base_url is not None:
         set_setting("gdb15_open_base_url", normalize_base_url(base_url))
     if api_key is not None and api_key.strip():
         set_setting("gdb15_open_api_key", api_key.strip())
+    elif clear_api_key:
+        set_setting("gdb15_open_api_key", "")
     return open_api_status()
 
 
@@ -213,6 +229,12 @@ async def _request(client: httpx.AsyncClient, method: str, url: str,
         payload = None
 
     if response.status_code >= 400:
+        if response.status_code == 401:
+            # 服务端对「Key 不存在」和「Key 填错东西」回的是同一句 401。
+            # 能在本地认出形状，就别把客户的注意力引到「是不是被吊销了」。
+            problem = open_api_key_problem(api_key)
+            if problem:
+                raise OpenApiError(problem)
         raise OpenApiError(_error_message(response.status_code, payload))
     if not isinstance(payload, dict):
         raise OpenApiError("gdb15 返回的内容格式不对。")

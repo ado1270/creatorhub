@@ -131,6 +131,7 @@ from .selfcheck import run_selfcheck
 from .gdb15_open import (CSV_MIME, XLSX_MIME, OpenApiError, build_csv,
                          build_xlsx, collect_leads, open_api_status,
                          push_status, save_open_api_settings, since_days_ago)
+from .gdb15_keys import push_key_problem
 from .license import (account_budget, effective_status, license_enforced,
                       license_settings, license_loop, verify as verify_license)
 from .intake import (create_mobile_session, fetch_recent as fetch_intake_recent,
@@ -5511,6 +5512,7 @@ class SettingsIn(BaseModel):
     license_enabled: bool | None = None
     license_url: str | None = None
     license_api_key: str | None = None         # 留空=不修改已保存的 Key
+    license_api_key_clear: bool | None = None  # True=删掉已保存的 Key，回到复用推送 Key
 
 
 def _settings_dict() -> dict:
@@ -5667,6 +5669,9 @@ async def put_settings(body: SettingsIn):
             raise HTTPException(400, str(e))
         set_setting("lead_push_url", url)
     if body.lead_push_api_key:
+        problem = push_key_problem(body.lead_push_api_key)
+        if problem:
+            raise HTTPException(400, problem)
         set_setting("lead_push_api_key", body.lead_push_api_key.strip())
     if body.license_enabled is not None:
         want = bool(body.license_enabled)
@@ -5680,7 +5685,16 @@ async def put_settings(body: SettingsIn):
             raise HTTPException(400, "gdb15 授权地址必须是 HTTPS")
         set_setting("license_url", url)
     if body.license_api_key:
+        # 这一框填错不只是「授权不通过」：授权被拒会把本地套餐清零并锁死，
+        # 而 license_enforced() 之后一直为真，开关关不掉。所以必须在存之前就拦住。
+        problem = push_key_problem(body.license_api_key)
+        if problem:
+            raise HTTPException(400, problem)
         set_setting("license_api_key", body.license_api_key.strip())
+    elif body.license_api_key_clear:
+        # 留空=不修改，是这套设置页一贯的约定 —— 代价是填错了在页面上清不掉。
+        # 删掉之后回到「复用线索推送那把 Key」，这是没单独配 Key 时的默认状态。
+        set_setting("license_api_key", "")
     return _settings_dict()
 
 
@@ -5718,6 +5732,7 @@ async def test_lead_push_settings():
 class OpenApiSettingsIn(BaseModel):
     base_url: str | None = None
     api_key: str | None = None      # 留空=不修改已保存的 Key
+    clear_api_key: bool = False     # True=删掉已保存的 Key
 
 
 class OpenApiStatusIn(BaseModel):
@@ -5734,7 +5749,8 @@ async def get_open_api_settings():
 @app.put("/api/gdb15/open/settings")
 async def put_open_api_settings(body: OpenApiSettingsIn):
     try:
-        return save_open_api_settings(body.base_url, body.api_key)
+        return save_open_api_settings(body.base_url, body.api_key,
+                                      body.clear_api_key)
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
 

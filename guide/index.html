@@ -233,7 +233,7 @@ cd creatorhub</code></pre><p>克隆方式便于以后更新；ZIP 方式不要�
       <h3>按现象排查</h3>
       <div class="table-scroll"><table><thead><tr><th scope="col">看到的情况</th><th scope="col">先看哪里</th></tr></thead><tbody>
         <tr><th scope="row">线索没进 gdb15</th><td>设置页「待补推线索」条数大于 0，说明推送失败，点「立即补推」并看失败原因，多半是地址、Key 或套餐到期。</td></tr>
-        <tr><th scope="row">导出提示 Key 无效 / 权限不足</th><td>确认填的是后台「开放 API」页单独签发的那把 Key，不是线索推送用的那把。</td></tr>
+        <tr><th scope="row">导出提示 Key 无效 / 权限不足</th><td>确认填的是后台「开放 API」页单独签发的那把 Key（开头是 <code>gdb15_</code>），不是线索推送用的那把（<code>lk_</code> 开头），也不是卡密（4 组 16 位）。</td></tr>
         <tr><th scope="row">额度突然不计数</th><td>看「服务端授权」的状态与到期时间。授权失效后会退回本地配置，监控位限制可能随之改变。</td></tr>
         <tr><th scope="row">同步代理后账号出口变了</th><td>云端指派只落在没绑代理的账号上；已绑定的不会被改动。要改绑在 gdb15 后台操作。</td></tr>
         <tr><th scope="row">交付前想确认链路通没通</th><td>打开设置页，「获客链路自检」会逐项检查采集账号、监控、推送开关与积压、额度剩余和近期产出。</td></tr>
